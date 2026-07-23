@@ -833,6 +833,67 @@ pub(crate) mod disk_index_builder_tests {
             Ok(())
         }
 
+        /// Like `build`, but drives `DiskIndexBuilder::build_with_alternate_disk_dataset` instead
+        /// of `build` for the final disk-layout write, reading node vectors from
+        /// `alt_dataset_path` instead of `self.params.data_path`. Graph construction and PQ still
+        /// use `self.params.data_path` (`T`), matching production usage where the alternate
+        /// dataset is a compressed encoding of the same rows, not independent data.
+        pub fn build_with_alternate_dataset<T, AltT>(&self, alt_dataset_path: &str) -> ANNResult<()>
+        where
+            T: GraphDataType<VectorIdType = u32>,
+            AltT: GraphDataType<VectorIdType = u32>,
+            StorageProvider::Reader: std::marker::Send + Read,
+        {
+            let disk_index_build_parameters = DiskIndexBuildParameters::new(
+                MemoryBudget::try_from_gb(self.params.index_build_ram_gb)?,
+                self.params.build_quantization_type,
+                NumPQChunks::new_with(self.params.num_pq_chunks, self.params.full_dim)?,
+            );
+
+            let config = config::Builder::new_with(
+                self.params.max_degree.into_usize(),
+                config::MaxDegree::default_slack(),
+                self.params.l_build.into_usize(),
+                self.params.metric.into(),
+                |b| {
+                    b.saturate_after_prune(true);
+                },
+            )
+            .build()?;
+
+            let metadata =
+                load_metadata_from_file(self.storage_provider.as_ref(), &self.params.data_path)
+                    .unwrap();
+
+            let config = IndexConfiguration::new(
+                self.params.metric,
+                self.params.dim,
+                metadata.npoints(),
+                ONE,
+                self.params.num_threads,
+                config,
+            )
+            .with_pseudo_rng_from_seed(100);
+
+            let disk_index_writer = DiskIndexWriter::new(
+                self.params.data_path.clone(),
+                self.params.index_path_prefix.clone(),
+                self.params.associated_data_path.clone(),
+                self.params.block_size,
+            )?;
+
+            let mut disk_index = DiskIndexBuilder::<T, _>::new(
+                self.storage_provider.as_ref(),
+                disk_index_build_parameters,
+                config,
+                disk_index_writer,
+            )?;
+
+            disk_index.build_with_alternate_disk_dataset::<AltT>(alt_dataset_path)?;
+
+            Ok(())
+        }
+
         pub fn compare_pq_compressed_files(&self) {
             self.compare_files(
                 &self.params.pq_compressed_path(),
@@ -982,6 +1043,52 @@ pub(crate) mod disk_index_builder_tests {
             &fixture.params.index_path_prefix,
             fixture.params.truth_index_path_prefix(),
             "_disk.index",
+        );
+    }
+
+    /// Proves the core claim `build_with_alternate_disk_dataset` relies on: routing the final
+    /// disk-layout write through a second `DiskIndexWriter` (same prefix, alternate dataset file)
+    /// does not perturb graph construction or corrupt the adjacency it picks up. Feeds the *same*
+    /// fp32 dataset through both the normal path and the alternate-dataset path (as its own
+    /// "alternate" dataset) — with identical inputs and the same seeded RNG, the two builds should
+    /// produce byte-identical `_disk.index` files. This isolates the write-side mechanism from
+    /// Spherical compression correctness, which is a separate, later concern.
+    #[test]
+    fn test_build_with_alternate_disk_dataset_matches_normal_build() {
+        let normal_prefix = format!("{}_alt_dataset_normal", INDEX_PATH_PREFIX);
+        let alt_prefix = format!("{}_alt_dataset_alt", INDEX_PATH_PREFIX);
+
+        // Both fixtures must share one storage provider/overlay — otherwise compare_files (which
+        // reads through a single fixture's provider) can't see the other fixture's output.
+        let shared_storage = Arc::new(new_vfs());
+
+        let normal_fixture = IndexBuildFixture {
+            storage_provider: Arc::clone(&shared_storage),
+            params: TestParams {
+                index_path_prefix: normal_prefix.clone(),
+                ..TestParams::default()
+            },
+        };
+        normal_fixture.build::<GraphDataF32VectorU32Data>().unwrap();
+
+        let alt_fixture = IndexBuildFixture {
+            storage_provider: Arc::clone(&shared_storage),
+            params: TestParams {
+                index_path_prefix: alt_prefix.clone(),
+                ..TestParams::default()
+            },
+        };
+        // Feed the *same* dataset file back in as the "alternate" dataset — with identical rows,
+        // in the same order, the write-side trick should produce identical output.
+        alt_fixture
+            .build_with_alternate_dataset::<GraphDataF32VectorU32Data, GraphDataF32VectorU32Data>(
+                &alt_fixture.params.data_path.clone(),
+            )
+            .unwrap();
+
+        alt_fixture.compare_files(
+            &get_disk_index_file(&normal_prefix),
+            &get_disk_index_file(&alt_prefix),
         );
     }
 

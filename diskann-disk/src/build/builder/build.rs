@@ -220,6 +220,56 @@ where
         })
     }
 
+    /// Like [`Self::build`], but the final disk-layout write embeds pre-compressed `u8` bytes
+    /// (from `alt_dataset_file`) instead of the fp32 dataset this builder was constructed with.
+    ///
+    /// Graph construction and PQ generation are unaffected: both still run against the original
+    /// fp32 dataset (`self.index_writer`'s dataset file), so graph quality is untouched. Only the
+    /// final `index_disk.index` write is redirected to a second `DiskIndexWriter` pointed at
+    /// `alt_dataset_file` but the *same* `index_path_prefix` — so it picks up the graph adjacency
+    /// (`<prefix>_mem.index`) the first writer already built, and embeds `alt_dataset_file`'s bytes
+    /// as the per-node "vector" instead of re-reading the fp32 dataset.
+    ///
+    /// `alt_dataset_file` must contain exactly `self.index_configuration.max_points` records, each
+    /// `dims * size_of::<AltData::VectorDataType>()` bytes, in the same row order as the original
+    /// dataset (row `i` here must be the compressed form of row `i` there) — the graph adjacency
+    /// refers to nodes by row index, so a reordering here would silently attach the wrong vector to
+    /// the wrong node's edges.
+    pub fn build_with_alternate_disk_dataset<AltData>(
+        &mut self,
+        alt_dataset_file: &str,
+    ) -> ANNResult<()>
+    where
+        AltData: GraphDataType<VectorIdType = u32>,
+        AltData::VectorDataType: VectorRepr,
+    {
+        let runtime = create_runtime(self.index_configuration.num_threads)?;
+        runtime.block_on(async {
+            let pool = create_thread_pool(self.index_configuration.num_threads)?;
+
+            // Unchanged: PQ sidecar + graph, both built from the original fp32 dataset.
+            self.generate_compressed_data(pool.as_ref()).await?;
+            self.build_inmem_index(pool.as_ref()).await?;
+
+            // NEW: a second writer, same prefix (so it finds the just-built `<prefix>_mem.index`),
+            // pointed at the alternate (compressed) dataset instead of the original fp32 one.
+            let alt_writer = DiskIndexWriter::new(
+                alt_dataset_file.to_string(),
+                self.index_writer.get_index_path_prefix(),
+                None, // no associated-data file for this path
+                self.index_writer.block_size(),
+            )?;
+            alt_writer.create_disk_layout::<AltData, StorageProvider>(self.storage_provider)?;
+
+            // Same cleanup the normal path performs after writing the disk layout (deletes the
+            // now-consumed `<prefix>_mem.index`).
+            self.index_writer
+                .index_build_cleanup(self.storage_provider)?;
+
+            Ok(())
+        })
+    }
+
     async fn build_internal(&mut self) -> ANNResult<()> {
         let mut logger = PerfLogger::new_disk_index_build_logger();
 
