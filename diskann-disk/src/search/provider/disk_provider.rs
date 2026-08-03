@@ -33,6 +33,8 @@ use diskann_providers::storage::StorageReadProvider;
 /// Assoc payload width, in bytes, at or below which a shard is RESIDENT: a single routing u32.
 /// Anything wider carries inline neighbour codes.
 const INLINE_ASSOC_MIN: usize = 4;
+/// Ranks beyond this cannot be represented in the u32 coded mask.
+const INLINE_MAX_DEGREE: usize = 32;
 use diskann_providers::{
     model::{
         compute_pq_distance, compute_pq_distance_for_pq_coordinates,
@@ -674,6 +676,24 @@ where
         Ok(())
     }
 
+    /// The coded-edge mask for `parent`, or `None` on a resident shard.
+    ///
+    /// Read from the node's own payload (`[routing_id, coded_mask, codes…]`), so it reflects what
+    /// was actually written rather than a rebuilt guess at the selection policy.
+    fn inline_coded_mask(&self, parent: &u32) -> ANNResult<Option<u32>> {
+        if self.provider.graph_header.metadata().associated_data_length <= INLINE_ASSOC_MIN {
+            return Ok(None);
+        }
+        let assoc = self.scratch.vertex_provider.get_associated_bytes(parent)?;
+        if assoc.len() < 8 {
+            return Err(ANNError::log_index_error(format!(
+                "inline assoc for {parent} is {} bytes, too short for [routing, mask]",
+                assoc.len()
+            )));
+        }
+        Ok(Some(u32::from_le_bytes([assoc[4], assoc[5], assoc[6], assoc[7]])))
+    }
+
     /// Score `ids` from the codes stored inside `parent`'s own node record.
     ///
     /// Payload layout (docs/inline-node-format.md in coreset-db):
@@ -722,7 +742,7 @@ where
                     "inline: {id} is not in {parent}'s adjacency list"
                 )));
             };
-            if rank >= 32 || (mask >> rank) & 1 == 0 {
+            if rank >= INLINE_MAX_DEGREE || (mask >> rank) & 1 == 0 {
                 continue; // uncoded edge: no cheap score, so it is not offered
             }
             let slot = (mask & ((1u32 << rank) - 1)).count_ones() as usize;
@@ -815,13 +835,27 @@ where
             let mut ids = Vec::new();
             for i in load_ids {
                 ids.clear();
+                // On an INLINE shard, drop edges that carry no code BEFORE the predicate sees
+                // them. `pred.eval_mut` is stateful -- it marks an id visited -- so letting an
+                // unscoreable edge through burns that id permanently, and a later parent that DOES
+                // carry its code can never insert it. That silently caps reachability at the union
+                // of first-seen coded edges, which shows up as recall that saturates and no longer
+                // improves with a larger search list.
+                let coded_mask = self.inline_coded_mask(&i)?;
                 ids.extend(
                     self.scratch
                         .vertex_provider
                         .get_adjacency_list(&i)?
                         .iter()
                         .copied()
-                        .filter(|id| pred.eval_mut(id)),
+                        .enumerate()
+                        .filter(|(rank, _)| match coded_mask {
+                            Some(mask) => *rank < INLINE_MAX_DEGREE && (mask >> rank) & 1 == 1,
+                            None => true,
+                        })
+                        .map(|(_, id)| id)
+                        .filter(|id| pred.eval_mut(id))
+                        .collect::<Vec<_>>(),
                 );
 
                 self.pq_distances(Some(i), &ids, &mut |dist, id| f(id, dist))?;
