@@ -71,6 +71,26 @@ where
         }
     }
 
+    fn get_associated_bytes(&self, vertex_id: &Data::VectorIdType) -> ANNResult<&[u8]> {
+        // The static cache stores associated data DECODED into `AssociatedDataType`, so a cached
+        // node's raw bytes are simply not retained and cannot be reconstructed here. Fail closed
+        // rather than fall through to the inner provider, which would either miss (the node was
+        // never loaded there) or, worse, return a different node's bytes from a stale slot.
+        //
+        // Consequence: an inline neighbour-code layout cannot be combined with a warmed BFS cache
+        // until the cache carries raw bytes too. With `cache_bfs_nodes = 0` -- the current default
+        // -- the cache is empty and every lookup delegates, so inline works today.
+        if self.cache.get_associated_data(vertex_id).is_some() {
+            return Err(ANNError::log_get_vertex_data_error(
+                vertex_id.to_string(),
+                "AssociatedBytes (vertex is in the static cache, which retains only decoded \
+                 associated data -- raw bytes are unavailable for cached nodes)"
+                    .to_string(),
+            ));
+        }
+        self.vector_provider.get_associated_bytes(vertex_id)
+    }
+
     fn load_vertices(&mut self, vertex_ids: &[Data::VectorIdType]) -> ANNResult<()> {
         self.clear_before_next_read();
 

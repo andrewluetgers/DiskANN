@@ -323,6 +323,80 @@ mod disk_vertex_provider_tests {
         QuantizationType,
     };
 
+    /// A WIDE associated payload must round-trip byte-for-byte.
+    ///
+    /// The scalar test above passes with a one-element payload, but writer and reader disagree
+    /// about the units of `associated_data_length`: the writer emits
+    /// `length * size_of::<AssociatedDataType>()` bytes (disk_index_writer.rs:304,379) while the
+    /// legacy reader path slices `length` BYTES. For a small u32 that happens to land on the right
+    /// value, because little-endian puts the low byte first -- it is not a correct decode. A
+    /// multi-element payload has no such luck, and the inline neighbour-code layout
+    /// (`[routing_id, coded_mask, codes...]`) is exactly that, so this pins the byte stride
+    /// `get_associated_bytes` uses.
+    #[test]
+    fn wide_associated_data_round_trips_as_bytes() {
+        const NPTS: u32 = 256;
+        const NCOLS: u32 = 4; // u32 words per node -> 16 bytes
+
+        let storage_provider = Arc::new(VirtualStorageProvider::new_overlay(test_data_root()));
+        let assoc_path = "/sift/wide_assoc_4x_u32.fbin";
+
+        // fbin: [u32 npts][u32 ncols][row-major u32 payload]. Word 0 mimics the routing id so the
+        // layout matches the real one; the rest is a per-node pattern that a wrong stride cannot
+        // reproduce by accident.
+        let expected: Vec<Vec<u32>> = (0..NPTS)
+            .map(|i| (0..NCOLS).map(|w| i.wrapping_mul(1000).wrapping_add(w * 7 + 1)).collect())
+            .collect();
+        {
+            let mut w = storage_provider.create_for_write(assoc_path).unwrap();
+            w.write_all(&NPTS.to_le_bytes()).unwrap();
+            w.write_all(&NCOLS.to_le_bytes()).unwrap();
+            for row in &expected {
+                for v in row {
+                    w.write_all(&v.to_le_bytes()).unwrap();
+                }
+            }
+            w.flush().unwrap();
+        }
+
+        let index_path_prefix = "/disk_index_search/disk_index_wide_assoc_test";
+        generate_disk_index_with_assoc_path(
+            storage_provider.as_ref(),
+            index_path_prefix,
+            assoc_path,
+        );
+
+        let factory = DiskVertexProviderFactory::new(
+            VirtualAlignedReaderFactory::new(
+                get_disk_index_file(index_path_prefix).to_string(),
+                storage_provider.clone(),
+            ),
+            CachingStrategy::None,
+        )
+        .unwrap();
+        let (mut vp, _header) = create_disk_provider::<GraphDataF32VectorU32Data>(&factory);
+
+        let nodes: Vec<u32> = (0..NPTS).collect();
+        VertexProvider::load_vertices(&mut vp, &nodes).unwrap();
+        for (idx, vid) in nodes.iter().enumerate() {
+            VertexProvider::process_loaded_node(&mut vp, vid, idx).unwrap();
+        }
+
+        for vid in 0..NPTS {
+            let raw = VertexProvider::get_associated_bytes(&vp, &vid).unwrap();
+            assert_eq!(
+                raw.len(),
+                NCOLS as usize * std::mem::size_of::<u32>(),
+                "stride must be element_count * size_of::<AssociatedDataType>()"
+            );
+            let got: Vec<u32> = raw
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            assert_eq!(got, expected[vid as usize], "payload mismatch for vertex {vid}");
+        }
+    }
+
     fn generate_disk_index_with_associated_data<StorageProviderType>(
         storage_provider: &StorageProviderType,
         index_path_prefix: &str,
@@ -331,10 +405,25 @@ mod disk_vertex_provider_tests {
         <StorageProviderType as StorageReadProvider>::Reader: std::marker::Send,
         StorageProviderType: 'static,
     {
+        generate_disk_index_with_assoc_path(
+            storage_provider,
+            index_path_prefix,
+            "/sift/siftsmall_learn_256pts_u32_associated_data.fbin",
+        )
+    }
+
+    fn generate_disk_index_with_assoc_path<StorageProviderType>(
+        storage_provider: &StorageProviderType,
+        index_path_prefix: &str,
+        associated_data_path: &str,
+    ) where
+        StorageProviderType: StorageReadProvider + StorageWriteProvider,
+        <StorageProviderType as StorageReadProvider>::Reader: std::marker::Send,
+        StorageProviderType: 'static,
+    {
         let max_degree = 4;
         let l_build = 50;
         let data_path = "/disk_index_search/disk_index_siftsmall_learn_256pts_data.fbin";
-        let associated_data_path = "/sift/siftsmall_learn_256pts_u32_associated_data.fbin";
 
         let metadata = load_metadata_from_file(storage_provider, data_path).unwrap();
 
