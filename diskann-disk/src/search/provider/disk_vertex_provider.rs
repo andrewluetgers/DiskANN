@@ -47,6 +47,10 @@ where
 
     // The cached associated data.
     cached_associated_data: Vec<Data::AssociatedDataType>,
+    // The same payload as raw bytes, flat with stride `associated_data_size`. An inline
+    // neighbour-code layout needs the whole record, not one deserialized scalar. Bounded by
+    // the beam, not the corpus -- this cache only ever holds `max_batch_size` nodes.
+    cached_associated_bytes: Vec<u8>,
 
     // A hashmap containing the loaded vertex_ids to local data offsets.
     loaded_nodes: HashMap<Data::VectorIdType, Offsets>,
@@ -105,6 +109,25 @@ where
             None => Err(ANNError::log_get_vertex_data_error(
                 vertex_id.to_string(),
                 "AssociatedData".to_string(),
+            )),
+        }
+    }
+
+    fn get_associated_bytes(&self, vertex_id: &Data::VectorIdType) -> ANNResult<&[u8]> {
+        match self.loaded_nodes.get(vertex_id) {
+            Some(local_offset) => {
+                let start = local_offset.vec_idx * self.associated_data_size;
+                let end = start + self.associated_data_size;
+                self.cached_associated_bytes.get(start..end).ok_or_else(|| {
+                    ANNError::log_get_vertex_data_error(
+                        vertex_id.to_string(),
+                        "AssociatedBytes (cache shorter than the recorded stride)".to_string(),
+                    )
+                })
+            }
+            None => Err(ANNError::log_get_vertex_data_error(
+                vertex_id.to_string(),
+                "AssociatedBytes".to_string(),
             )),
         }
     }
@@ -173,6 +196,9 @@ where
             )
         })?;
         self.cached_associated_data.push(associated_data);
+        self.cached_associated_bytes.extend_from_slice(
+            &neighbor_and_data_buf[data_end - self.associated_data_size..data_end],
+        );
 
         // due to async nature i/o operation finished: vec_idx is different from request issue index: idx
         let vec_idx = self.loaded_nodes.len();
@@ -218,6 +244,9 @@ where
             vector_buf: vec![Data::VectorDataType::default(); max_batch_size * dim],
             cached_adjacency_list: Vec::with_capacity(max_batch_size),
             cached_associated_data: Vec::with_capacity(max_batch_size),
+            cached_associated_bytes: Vec::with_capacity(
+                max_batch_size * metadata.associated_data_length,
+            ),
             loaded_nodes: HashMap::with_capacity(max_batch_size),
             associated_data_size: metadata.associated_data_length,
             node_len: metadata.node_len,
@@ -232,6 +261,8 @@ where
             self.sector_graph.reconfigure(max_batch_size)?;
             self.cached_adjacency_list.reserve(max_batch_size);
             self.cached_associated_data.reserve(max_batch_size);
+            self.cached_associated_bytes
+                .reserve(max_batch_size * self.associated_data_size);
             self.loaded_nodes.reserve(max_batch_size);
             self.vector_buf = vec![Data::VectorDataType::default(); max_batch_size * self.dim];
             self.max_batch_size = max_batch_size;
@@ -258,6 +289,7 @@ where
         self.loaded_nodes.clear();
         self.cached_adjacency_list.clear();
         self.cached_associated_data.clear();
+        self.cached_associated_bytes.clear();
     }
 }
 

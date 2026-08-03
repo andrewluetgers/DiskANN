@@ -4,7 +4,7 @@
  */
 
 use crate::data_model::GraphDataType;
-use diskann::ANNResult;
+use diskann::{ANNError, ANNResult};
 
 /// `VertexProvider` is a trait that abstracts the access to Vertex data.
 ///
@@ -63,6 +63,24 @@ pub trait VertexProvider<Data: GraphDataType>: Send + Sync {
         &self,
         vertex_id: &Data::VectorIdType,
     ) -> ANNResult<&Data::AssociatedDataType>;
+
+    /// The vertex's associated data as **raw bytes**, exactly as it sits in the node record.
+    ///
+    /// [`get_associated_data`](Self::get_associated_data) bincode-deserializes the payload into a
+    /// single `AssociatedDataType`, which is right for a scalar label but cannot express a
+    /// multi-field payload. An inline neighbour-code layout stores
+    /// `[routing_id, coded_mask, codes...]` per node and needs the bytes at a known offset, so it
+    /// reads them here instead. Both views address the same bytes; neither costs extra I/O,
+    /// because the node's sector is already resident.
+    ///
+    /// Defaults to an error so existing providers need no change — only those that actually carry
+    /// a wide payload implement it.
+    fn get_associated_bytes(&self, vertex_id: &Data::VectorIdType) -> ANNResult<&[u8]> {
+        Err(ANNError::log_get_vertex_data_error(
+            vertex_id.to_string(),
+            "AssociatedBytes (provider does not expose raw associated data)".to_string(),
+        ))
+    }
 
     /// This function loads a batch of vertices for a given set of vertex ids and cache it in the `VertexProvider` instance. It is a mutable operation so it takes a mutable self.
     ///
