@@ -29,9 +29,13 @@ use diskann::{
     ANNError, ANNResult,
 };
 use diskann_providers::storage::StorageReadProvider;
+
+/// Assoc payload width, in bytes, at or below which a shard is RESIDENT: a single routing u32.
+/// Anything wider carries inline neighbour codes.
+const INLINE_ASSOC_MIN: usize = 4;
 use diskann_providers::{
     model::{
-        compute_pq_distance,
+        compute_pq_distance, compute_pq_distance_for_pq_coordinates,
         graph::provider::{determinant_diversity, DeterminantDiversityParams},
     },
     storage::{get_compressed_pq_file, get_disk_index_file, get_pq_pivot_file, LoadWith},
@@ -643,10 +647,15 @@ where
     where
         F: FnMut(f32, u32),
     {
-        // Absolute PQ reads a shared resident table, so the anchor is unused today. Named with a
-        // leading underscore rather than dropped from the signature: the callers now supply the
-        // correct value, so an inline scorer is a body change here and nothing else.
-        let _anchor = parent;
+        // An INLINE shard carries each node's neighbour codes in its own record, so score from
+        // there instead of the shared resident table. Detected from the assoc width rather than a
+        // flag: `associated_data_length` is 4 bytes (one routing u32) for a resident shard and
+        // wider for an inline one, so the two are distinguishable without a format version.
+        if let Some(parent) = parent {
+            if self.provider.graph_header.metadata().associated_data_length > INLINE_ASSOC_MIN {
+                return self.pq_distances_inline(parent, ids, f);
+            }
+        }
         let pq_scratch = &mut self.scratch.pq_scratch;
         compute_pq_distance(
             ids,
@@ -662,6 +671,77 @@ where
             f(distance, *id);
         }
 
+        Ok(())
+    }
+
+    /// Score `ids` from the codes stored inside `parent`'s own node record.
+    ///
+    /// Payload layout (docs/inline-node-format.md in coreset-db):
+    /// `[routing_id u32][coded_mask u32][codes…]`, codes packed contiguously in ascending
+    /// adjacency-rank order and padded to 4-byte boundaries. An edge's slot is the popcount of the
+    /// mask below its rank.
+    ///
+    /// `ids` arrives filtered by the search predicate, so its positions are NOT ranks -- the rank
+    /// is recovered from the parent's adjacency list. Getting that wrong would score each
+    /// neighbour against a different neighbour's code, which produces plausible wrong answers
+    /// rather than an error.
+    ///
+    /// **Uncoded edges are skipped**, i.e. not offered to the frontier. That is the honest
+    /// behaviour for a layout that truncates codes: with no code there is no cheap score, and the
+    /// alternative -- spending a sector read to score the neighbour exactly -- is a policy choice
+    /// with its own read-amplification cost, deliberately left out of the format so it can be
+    /// measured separately.
+    fn pq_distances_inline<F>(&mut self, parent: u32, ids: &[u32], mut f: F) -> ANNResult<()>
+    where
+        F: FnMut(f32, u32),
+    {
+        let num_chunks = self.provider.pq_data.get_num_chunks();
+        let code_words = num_chunks.div_ceil(4);
+
+        // Copy both out before touching pq_scratch: they borrow the vertex provider, and the
+        // scoring below needs a mutable borrow of the scratch that lives in the same struct.
+        let (adjacency, assoc) = {
+            let vp = &self.scratch.vertex_provider;
+            let adj = vp.get_adjacency_list(&parent)?.to_vec();
+            let assoc = vp.get_associated_bytes(&parent)?.to_vec();
+            (adj, assoc)
+        };
+        if assoc.len() < 8 {
+            return Err(ANNError::log_index_error(format!(
+                "inline assoc for {parent} is {} bytes, too short for [routing, mask]",
+                assoc.len()
+            )));
+        }
+        let mask = u32::from_le_bytes([assoc[4], assoc[5], assoc[6], assoc[7]]);
+
+        for id in ids {
+            let Some(rank) = adjacency.iter().position(|n| n == id) else {
+                // The id came from this parent's adjacency list, so absence means the list and the
+                // payload disagree -- a corrupt shard, not a filtered edge.
+                return Err(ANNError::log_index_error(format!(
+                    "inline: {id} is not in {parent}'s adjacency list"
+                )));
+            };
+            if rank >= 32 || (mask >> rank) & 1 == 0 {
+                continue; // uncoded edge: no cheap score, so it is not offered
+            }
+            let slot = (mask & ((1u32 << rank) - 1)).count_ones() as usize;
+            let start = 8 + slot * code_words * 4;
+            let Some(code) = assoc.get(start..start + num_chunks) else {
+                return Err(ANNError::log_index_error(format!(
+                    "inline: {parent} slot {slot} runs past its {} byte payload",
+                    assoc.len()
+                )));
+            };
+            let pq_scratch = &mut self.scratch.pq_scratch;
+            compute_pq_distance_for_pq_coordinates(
+                code,
+                num_chunks,
+                &pq_scratch.aligned_pqtable_dist_scratch,
+                &mut pq_scratch.aligned_dist_scratch,
+            )?;
+            f(self.scratch.pq_scratch.aligned_dist_scratch[0], *id);
+        }
         Ok(())
     }
 }
