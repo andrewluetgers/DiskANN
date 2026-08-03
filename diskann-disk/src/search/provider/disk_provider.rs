@@ -769,7 +769,31 @@ where
         F: FnMut(Self::Id, f32) + Send,
     {
         let start_vertex_id = self.provider.graph_header.metadata().medoid as u32;
-        self.pq_distances(None, &[start_vertex_id], |dist, id| f(id, dist))
+
+        // The start vertex has no parent, so there is no node record holding ITS code -- an inline
+        // code lives in the parent's record, and the start point has none. Scoring it through
+        // `pq_distances` therefore fell through to the resident PQ table, which an inline shard is
+        // not supposed to depend on: a shard whose resident codes were absent or stale would still
+        // "work" except for its very first comparison, which is exactly the kind of leak that
+        // survives a differential test and corrupts a measurement.
+        //
+        // Instead load the vertex and score it EXACTLY from its own stored vector, as LM-DiskANN's
+        // Algorithm 1 line 13 does. One extra sector read per query, already amortised because the
+        // walk visits the start point immediately anyway, and it is strictly more accurate than a
+        // quantized estimate.
+        self.ensure_loaded(&[start_vertex_id])?;
+        let distance = self
+            .scratch
+            .distance_cache
+            .get(&start_vertex_id)
+            .map(|(d, _)| *d)
+            .ok_or_else(|| {
+                ANNError::log_index_error(format!(
+                    "start point {start_vertex_id} missing from the distance cache after load"
+                ))
+            })?;
+        f(start_vertex_id, distance);
+        Ok(())
     }
 
     fn expand_beam<Itr, P, F>(
