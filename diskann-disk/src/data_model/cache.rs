@@ -20,6 +20,19 @@ pub struct Cache<Data: GraphDataType<VectorIdType = u32>> {
     // The cached associated data list.
     associated_data: Vec<Data::AssociatedDataType>,
 
+    // The same payload as RAW BYTES, flat with stride `assoc_stride`.
+    //
+    // `associated_data` above is decoded into a single `AssociatedDataType`, which cannot express
+    // a multi-field record. An inline neighbour-code layout stores
+    // `[routing_id, coded_mask, codes...]` per node, so a cached node needs its bytes retained or
+    // it becomes unreadable the moment the cache is warmed -- which would make `cache_bfs_nodes`
+    // and inline coding mutually exclusive.
+    //
+    // Lazily sized: `assoc_stride` is 0 until the first payload arrives, so a cache that is never
+    // given bytes (every pre-inline caller) costs nothing.
+    associated_bytes: Vec<u8>,
+    assoc_stride: usize,
+
     // The dimension of the vectors in the cache.
     dimension: usize,
 
@@ -38,9 +51,51 @@ where
             vectors: vec![Data::VectorDataType::default(); capacity * dimension],
             adjacency_lists: Vec::with_capacity(capacity),
             associated_data: Vec::with_capacity(capacity),
+            associated_bytes: Vec::new(),
+            assoc_stride: 0,
             dimension,
             capacity,
         })
+    }
+
+    /// Retain a node's associated payload as raw bytes, alongside the decoded value.
+    ///
+    /// Separate from [`insert`](Self::insert) so no existing caller changes: a cache that is never
+    /// given bytes stays exactly as it was. Call after `insert`, which assigns the slot.
+    pub fn set_associated_bytes(
+        &mut self,
+        vector_id: &Data::VectorIdType,
+        bytes: &[u8],
+    ) -> ANNResult<()> {
+        let Some(&idx) = self.mapping.get(vector_id) else {
+            return Err(ANNError::log_index_error(format!(
+                "set_associated_bytes: {vector_id} is not in the cache; insert it first"
+            )));
+        };
+        if self.assoc_stride == 0 {
+            self.assoc_stride = bytes.len();
+            self.associated_bytes = vec![0u8; self.capacity * self.assoc_stride];
+        } else if bytes.len() != self.assoc_stride {
+            // A varying width would silently misalign every later lookup.
+            return Err(ANNError::log_index_error(format!(
+                "set_associated_bytes: payload is {} bytes but the cache stride is {}",
+                bytes.len(),
+                self.assoc_stride
+            )));
+        }
+        let start = idx * self.assoc_stride;
+        self.associated_bytes[start..start + self.assoc_stride].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// The node's raw associated payload, or `None` if it is absent or none was retained.
+    pub fn get_associated_bytes(&self, vector_id: &Data::VectorIdType) -> Option<&[u8]> {
+        if self.assoc_stride == 0 {
+            return None;
+        }
+        let idx = *self.mapping.get(vector_id)?;
+        let start = idx * self.assoc_stride;
+        self.associated_bytes.get(start..start + self.assoc_stride)
     }
 
     // Returns `true` if the cache contains the `vector_id`, otherwise `false`.

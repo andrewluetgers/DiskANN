@@ -397,6 +397,70 @@ mod disk_vertex_provider_tests {
         }
     }
 
+    /// The same wide payload must survive a WARMED BFS cache.
+    ///
+    /// `CachedDiskVertexProvider` serves cached nodes from a `Cache` that stores associated data
+    /// decoded into `AssociatedDataType`. Until the cache also retained raw bytes, warming it made
+    /// an inline neighbour-code payload unreadable -- so `cache_bfs_nodes > 0` and inline coding
+    /// were mutually exclusive, and turning the cache on by default (lever A0) would have silently
+    /// broken every inline arm. This pins that they coexist.
+    #[test]
+    fn wide_associated_data_survives_a_warmed_cache() {
+        const NPTS: u32 = 256;
+        const NCOLS: u32 = 4;
+
+        let storage_provider = Arc::new(VirtualStorageProvider::new_overlay(test_data_root()));
+        let assoc_path = "/sift/wide_assoc_cached_4x_u32.fbin";
+        let expected: Vec<Vec<u32>> = (0..NPTS)
+            .map(|i| (0..NCOLS).map(|w| i.wrapping_mul(31).wrapping_add(w * 5 + 3)).collect())
+            .collect();
+        {
+            let mut w = storage_provider.create_for_write(assoc_path).unwrap();
+            w.write_all(&NPTS.to_le_bytes()).unwrap();
+            w.write_all(&NCOLS.to_le_bytes()).unwrap();
+            for row in &expected {
+                for v in row {
+                    w.write_all(&v.to_le_bytes()).unwrap();
+                }
+            }
+            w.flush().unwrap();
+        }
+
+        let index_path_prefix = "/disk_index_search/disk_index_wide_assoc_cached_test";
+        generate_disk_index_with_assoc_path(
+            storage_provider.as_ref(),
+            index_path_prefix,
+            assoc_path,
+        );
+
+        // Warm a cache over part of the graph, so lookups hit BOTH paths.
+        let factory = DiskVertexProviderFactory::new(
+            VirtualAlignedReaderFactory::new(
+                get_disk_index_file(index_path_prefix).to_string(),
+                storage_provider.clone(),
+            ),
+            CachingStrategy::StaticCacheWithBfsNodes(64),
+        )
+        .unwrap();
+        let (mut vp, _header) = create_disk_provider::<GraphDataF32VectorU32Data>(&factory);
+
+        let nodes: Vec<u32> = (0..NPTS).collect();
+        VertexProvider::load_vertices(&mut vp, &nodes).unwrap();
+        for (idx, vid) in nodes.iter().enumerate() {
+            VertexProvider::process_loaded_node(&mut vp, vid, idx).unwrap();
+        }
+
+        for vid in 0..NPTS {
+            let raw = VertexProvider::get_associated_bytes(&vp, &vid)
+                .unwrap_or_else(|e| panic!("vertex {vid} with a warmed cache: {e}"));
+            let got: Vec<u32> = raw
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            assert_eq!(got, expected[vid as usize], "payload mismatch for cached vertex {vid}");
+        }
+    }
+
     fn generate_disk_index_with_associated_data<StorageProviderType>(
         storage_provider: &StorageProviderType,
         index_path_prefix: &str,

@@ -72,23 +72,23 @@ where
     }
 
     fn get_associated_bytes(&self, vertex_id: &Data::VectorIdType) -> ANNResult<&[u8]> {
-        // The static cache stores associated data DECODED into `AssociatedDataType`, so a cached
-        // node's raw bytes are simply not retained and cannot be reconstructed here. Fail closed
-        // rather than fall through to the inner provider, which would either miss (the node was
-        // never loaded there) or, worse, return a different node's bytes from a stale slot.
+        // Mirror get_associated_data: cache first, inner provider on miss. The cache retains the
+        // raw payload alongside the decoded one precisely so a warmed cache does not make an
+        // inline neighbour-code layout unreadable -- otherwise `cache_bfs_nodes` and inline
+        // coding would be mutually exclusive.
         //
-        // Consequence: an inline neighbour-code layout cannot be combined with a warmed BFS cache
-        // until the cache carries raw bytes too. With `cache_bfs_nodes = 0` -- the current default
-        // -- the cache is empty and every lookup delegates, so inline works today.
-        if self.cache.get_associated_data(vertex_id).is_some() {
-            return Err(ANNError::log_get_vertex_data_error(
+        // Fail closed if the node is cached but carries no bytes: delegating would either miss,
+        // since a cached node was never loaded into the inner provider, or return another node's
+        // bytes from a stale slot.
+        match self.cache.get_associated_bytes(vertex_id) {
+            Some(bytes) => Ok(bytes),
+            None if self.cache.contains(vertex_id) => Err(ANNError::log_get_vertex_data_error(
                 vertex_id.to_string(),
-                "AssociatedBytes (vertex is in the static cache, which retains only decoded \
-                 associated data -- raw bytes are unavailable for cached nodes)"
+                "AssociatedBytes (vertex is cached but no raw payload was retained for it)"
                     .to_string(),
-            ));
+            )),
+            None => self.vector_provider.get_associated_bytes(vertex_id),
         }
-        self.vector_provider.get_associated_bytes(vertex_id)
     }
 
     fn load_vertices(&mut self, vertex_ids: &[Data::VectorIdType]) -> ANNResult<()> {

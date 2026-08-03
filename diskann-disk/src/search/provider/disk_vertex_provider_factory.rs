@@ -227,12 +227,22 @@ impl<Data: GraphDataType<VectorIdType = u32>, ReaderFactory: AlignedReaderFactor
         let adjacency_list = vertex_provider.get_adjacency_list(node)?;
         let associated_data = vertex_provider.get_associated_data(node)?;
 
+        let associated_bytes = vertex_provider.get_associated_bytes(node).ok().map(<[u8]>::to_vec);
+
         cache.insert(
             node,
             vector,
             AdjacencyList::from_iter_untrusted(adjacency_list.iter().copied()),
             *associated_data,
-        )
+        )?;
+
+        // Retain the raw payload too, so a warmed cache does not make an inline neighbour-code
+        // layout unreadable. `ok()` because a provider that exposes no raw bytes is legitimate --
+        // every pre-inline shard -- and should not fail cache warming.
+        if let Some(bytes) = associated_bytes {
+            cache.set_associated_bytes(node, &bytes)?;
+        }
+        Ok(())
     }
 }
 
