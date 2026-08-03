@@ -631,10 +631,22 @@ where
 {
     // Compute the PQ distance between each ID in `ids` and the distance table stored in
     // `self`, invoking the callback with the results of each computation in order.
-    fn pq_distances<F>(&mut self, ids: &[u32], mut f: F) -> ANNResult<()>
+    //
+    // `parent` is the vertex whose adjacency list `ids` came from, or `None` when they did not
+    // come from one (the start point, and the full-scan path). Absolute codes ignore it, but an
+    // INLINE code lives in the parent's own node record, and a RESIDUAL code is encoded against
+    // the parent's stored vector -- so both need to know which vertex to read it from. Threading
+    // it here rather than at each call site is deliberate: this is the single seam every
+    // inline/residual/bound lever goes through, and doing it once avoids re-refactoring the same
+    // function per lever (plans/lever-implementation-plan.md, cross-cutting concern 1).
+    fn pq_distances<F>(&mut self, parent: Option<u32>, ids: &[u32], mut f: F) -> ANNResult<()>
     where
         F: FnMut(f32, u32),
     {
+        // Absolute PQ reads a shared resident table, so the anchor is unused today. Named with a
+        // leading underscore rather than dropped from the signature: the callers now supply the
+        // correct value, so an inline scorer is a body change here and nothing else.
+        let _anchor = parent;
         let pq_scratch = &mut self.scratch.pq_scratch;
         compute_pq_distance(
             ids,
@@ -677,7 +689,7 @@ where
         F: FnMut(Self::Id, f32) + Send,
     {
         let start_vertex_id = self.provider.graph_header.metadata().medoid as u32;
-        self.pq_distances(&[start_vertex_id], |dist, id| f(id, dist))
+        self.pq_distances(None, &[start_vertex_id], |dist, id| f(id, dist))
     }
 
     fn expand_beam<Itr, P, F>(
@@ -708,7 +720,7 @@ where
                         .filter(|id| pred.eval_mut(id)),
                 );
 
-                self.pq_distances(&ids, &mut |dist, id| f(id, dist))?;
+                self.pq_distances(Some(i), &ids, &mut |dist, id| f(id, dist))?;
             }
 
             Ok(())
@@ -990,7 +1002,7 @@ where
                 break;
             }
 
-            accessor.pq_distances(&id_buffer, |dist, id| best.insert(Neighbor::new(id, dist)))?;
+            accessor.pq_distances(None, &id_buffer, |dist, id| best.insert(Neighbor::new(id, dist)))?;
             cmps += id_buffer.len() as u32;
         }
 
