@@ -1224,6 +1224,7 @@ pub(crate) mod disk_index_builder_tests {
                 &mut distances,
                 &mut associated_data,
                 &crate::search::search_mode::SearchMode::graph(),
+                None, // edge_record: untraced
             );
 
             diskann_providers::test_utils::assert_top_k_exactly_match(

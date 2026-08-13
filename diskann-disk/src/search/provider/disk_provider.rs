@@ -21,7 +21,7 @@ use diskann::{
         ext::labeled::{self, QueryLabelProvider},
         glue::{self, DefaultPostProcessor, SearchPostProcess, SearchStrategy},
         search::{
-            record::{EdgeOutcome, RANK_UNATTRIBUTED},
+            record::{EdgeOutcome, SearchRecord, RANK_UNATTRIBUTED},
             AdaptiveL, InlineFilterSearch, Knn,
         },
         search_output_buffer, DiskANNIndex,
@@ -1288,20 +1288,30 @@ where
     /// Reuses the same `DiskAccessor` surface as the plain `Knn` graph path:
     /// `start_point_distances` and `expand_beam`, both of which call
     /// `pq_distances` internally.
-    async fn filter_search<'a, OB>(
+    /// `'r` is the sink's lifetime and is deliberately *independent* of `'a`, the strategy's.
+    /// Tying them together would require whatever the strategy borrows (the `IOTracker`, which is a
+    /// local of the caller) to outlive the sink, which it does not and should not have to — the
+    /// caller owns the sink and drains it after the search returns.
+    async fn filter_search<'a, 'r, OB>(
         &self,
         strategy: DiskSearchStrategy<'a, Data, ProviderFactory>,
         query: &[Data::VectorDataType],
         knn: Knn,
         label_provider: &(dyn QueryLabelProvider<u32> + 'a),
         adaptive_l: Option<AdaptiveL>,
+        edge_record: Option<&'r mut (dyn SearchRecord<u32> + 'r)>,
         output: &mut OB,
     ) -> ANNResult<graph::index::SearchStats>
     where
         OB: search_output_buffer::SearchOutputBuffer<(u32, Data::AssociatedDataType)> + Send,
     {
         let filtered_strategy = labeled::Filtered::new(strategy, label_provider);
-        let search = InlineFilterSearch::new(knn, adaptive_l);
+        let mut search = InlineFilterSearch::new(knn, adaptive_l);
+        // Absent sink (every production call) leaves the search running against the no-op
+        // recorder, so the traced expansion path is never selected.
+        if let Some(sink) = edge_record {
+            search = search.with_edge_record(sink);
+        }
         self.index
             .search(search, &filtered_strategy, &DefaultContext, query, output)
             .await
@@ -1316,6 +1326,38 @@ where
         search_list_size: u32,
         beam_width: Option<usize>,
         mode: SearchMode<'_>,
+    ) -> ANNResult<SearchResult<Data::AssociatedDataType>> {
+        self.search_traced(
+            query,
+            return_list_size,
+            search_list_size,
+            beam_width,
+            mode,
+            None,
+        )
+    }
+
+    /// As [`Self::search`], with a per-edge diagnostic sink attached.
+    ///
+    /// Only [`SearchMode::InlineFilter`] is instrumented; on any other mode the sink is accepted
+    /// and simply never called, so callers do not have to special-case the mode.
+    ///
+    /// The sink is a parameter rather than a field on [`SearchMode`] deliberately: a
+    /// `&'a mut dyn` inside `SearchMode<'a>` would make the lifetime **invariant**, and existing
+    /// callers rely on it being covariant — that change compiles nowhere useful and surfaces as
+    /// unrelated borrow errors at every call site. The sink is also orthogonal to which algorithm
+    /// the mode selects, so it does not belong in that sum type.
+    ///
+    /// Diagnostic only. A traced run perturbs cache and branch prediction; latency must come from
+    /// an untraced build.
+    pub fn search_traced<'r>(
+        &self,
+        query: &[Data::VectorDataType],
+        return_list_size: u32,
+        search_list_size: u32,
+        beam_width: Option<usize>,
+        mode: SearchMode<'_>,
+        edge_record: Option<&'r mut (dyn SearchRecord<u32> + 'r)>,
     ) -> ANNResult<SearchResult<Data::AssociatedDataType>> {
         let mut query_stats = QueryStatistics::default();
         let mut indices = vec![0u32; return_list_size as usize];
@@ -1333,6 +1375,7 @@ where
             &mut distances,
             &mut associated_data,
             &mode,
+            edge_record,
         )?;
 
         let mut search_result = SearchResult {
@@ -1358,7 +1401,7 @@ where
     /// Perform a raw search on the disk index.
     /// This is a lower-level API that allows more control over the search parameters and output buffers.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn search_internal(
+    pub(crate) fn search_internal<'r>(
         &self,
         query: &[Data::VectorDataType],
         k_value: usize,
@@ -1369,6 +1412,7 @@ where
         distances: &mut [f32],
         associated_data: &mut [Data::AssociatedDataType],
         mode: &SearchMode<'_>,
+        edge_record: Option<&'r mut (dyn SearchRecord<u32> + 'r)>,
     ) -> ANNResult<SearchResultStats> {
         let mut result_output_buffer = search_output_buffer::IdDistanceAssociatedData::new(
             &mut indices[..k_value],
@@ -1430,6 +1474,7 @@ where
                     knn_search,
                     filter.as_ref(),
                     adaptive_l.clone(),
+                    edge_record,
                     &mut result_output_buffer,
                 ))?
             }
@@ -1854,6 +1899,7 @@ mod disk_provider_tests {
                     &mut distances,
                     &mut associated_data,
                     &SearchMode::graph(),
+                    None, // edge_record: untraced
                 );
 
                 // Calculate the range of the truth_result for this query
@@ -2017,6 +2063,7 @@ mod disk_provider_tests {
             &mut distances,
             &mut associated_data,
             &SearchMode::graph(),
+            None, // edge_record: untraced
         );
 
         assert!(result.is_err());
@@ -2550,6 +2597,7 @@ mod disk_provider_tests {
             &mut distances,
             &mut associated_data,
             &make_mode(),
+            None, // edge_record: untraced
         );
 
         assert!(result.is_ok(), "Expected search to succeed");
