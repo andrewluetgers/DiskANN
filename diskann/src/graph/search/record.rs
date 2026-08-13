@@ -88,6 +88,20 @@ where
         // Default no-op implementation
     }
 
+    /// Whether this sink wants per-edge records at all.
+    ///
+    /// Recording edges costs more than the `record_edge` call itself: the traversal has to take a
+    /// *traced* beam-expansion path that reports adjacency entries the production path drops
+    /// without ever materialising. That is worth paying only for a sink that will use them.
+    ///
+    /// # Default implementation
+    /// `false`. For [`NoopSearchRecord`] this monomorphises to a constant, so the traced branch at
+    /// the call site is dead code and eliminated outright — production does not even evaluate a
+    /// condition. A diagnostic sink overrides this to `true`.
+    fn wants_edges(&self) -> bool {
+        false
+    }
+
     /// Records one traversed out-link: which edge it was, and how useful it turned out to be.
     ///
     /// # Parameters

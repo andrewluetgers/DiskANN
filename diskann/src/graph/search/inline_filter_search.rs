@@ -8,7 +8,11 @@
 use diskann_utils::future::SendFuture;
 use thiserror::Error;
 
-use super::{Knn, Search, record::SearchRecord, scratch::SearchScratch};
+use super::{
+    Knn, Search,
+    record::{EdgeOutcome, SearchRecord},
+    scratch::SearchScratch,
+};
 use crate::{
     ANNError, ANNErrorKind, ANNResult,
     error::IntoANNResult,
@@ -254,6 +258,12 @@ where
 
     // Pre-allocate with good capacity to avoid repeated allocations
     let mut one_hop_neighbors = Vec::with_capacity(max_degree_with_slack);
+    // Only ever filled on the traced path; stays a zero-capacity, never-allocating Vec otherwise.
+    let mut traced_neighbors = Vec::new();
+    // Which beam expansion an edge was read during. Distinct from `scratch.hops`, which counts
+    // nodes expanded (it advances by the beam width), whereas an edge's `hop` has to identify the
+    // iteration so the overlay can replay the walk one expansion at a time.
+    let mut beam_iteration: u16 = 0;
 
     let mut sample_visited: usize = 0;
     let mut sample_matched: usize = 0;
@@ -283,13 +293,70 @@ where
         }
 
         // compute distances from query to one-hop neighbors, and mark them visited
-        accessor
-            .expand_beam_filtered(
-                scratch.beam_nodes.iter().copied(),
-                glue::NotInMut::new(&mut scratch.visited),
-                |id, distance| one_hop_neighbors.push((id, distance)),
-            )
-            .await?;
+        if search_record.wants_edges() {
+            // Diagnostic path. Takes the traced expansion, which additionally reports adjacency
+            // entries the accessor drops internally (already-visited, and entries skipped before
+            // any distance) — those never reach the untraced callback at all, and they are exactly
+            // the wasted IO the instrumentation exists to quantify.
+            traced_neighbors.clear();
+            accessor
+                .expand_beam_filtered_traced(
+                    scratch.beam_nodes.iter().copied(),
+                    glue::NotInMut::new(&mut scratch.visited),
+                    |edge| traced_neighbors.push(edge),
+                )
+                .await?;
+
+            for edge in traced_neighbors.iter().copied() {
+                let Some(distance) = edge.dist else {
+                    // Dropped inside the accessor: its outcome is already terminal, and there is
+                    // no distance because none was ever computed. `None` is not zero.
+                    search_record.record_edge(
+                        edge.parent,
+                        edge.rank,
+                        edge.parent_out_degree,
+                        edge.child.into_inner(),
+                        None,
+                        edge.outcome,
+                        beam_iteration,
+                    );
+                    continue;
+                };
+
+                let child = edge.child.into_inner();
+                let outcome = if matches!(edge.child, glue::Decision::Reject(_)) {
+                    // Scored, then rejected by the inline filter. Still navigates (it goes into
+                    // `best` below, as on the untraced path), but the filter is the check it failed.
+                    EdgeOutcome::FilterRejected
+                } else if scratch.best.would_insert(Neighbor::new(child, distance)) {
+                    EdgeOutcome::EnteredFrontier
+                } else {
+                    EdgeOutcome::NotCloserThanFrontier
+                };
+                search_record.record_edge(
+                    edge.parent,
+                    edge.rank,
+                    edge.parent_out_degree,
+                    child,
+                    Some(distance),
+                    outcome,
+                    beam_iteration,
+                );
+
+                // Hand off to the shared processing loop below, so a traced run and an untraced run
+                // walk the graph identically — the trace must describe the real search, not a
+                // variant of it.
+                one_hop_neighbors.push((edge.child, distance));
+            }
+        } else {
+            accessor
+                .expand_beam_filtered(
+                    scratch.beam_nodes.iter().copied(),
+                    glue::NotInMut::new(&mut scratch.visited),
+                    |id, distance| one_hop_neighbors.push((id, distance)),
+                )
+                .await?;
+        }
 
         // Process one-hop neighbors based on on_visit() decision
         for (decision, distance) in one_hop_neighbors.iter().copied() {
@@ -308,6 +375,9 @@ where
 
         scratch.cmps += one_hop_neighbors.len() as u32;
         scratch.hops += scratch.beam_nodes.len() as u32;
+        // Saturating: a trace long enough to overflow u16 is already far past anything drawable,
+        // and wrapping would silently reorder the replay.
+        beam_iteration = beam_iteration.saturating_add(1);
 
         // Adaptive L: after enough samples, estimate specificity and scale L.
         if let Some(adaptive_l) = adaptive_l.as_ref()

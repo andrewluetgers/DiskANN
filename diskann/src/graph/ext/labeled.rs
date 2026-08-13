@@ -190,6 +190,35 @@ where
             .await
     }
 
+    /// Traced counterpart of [`Self::expand_beam_filtered`]. Pure pass-through: this wrapper only
+    /// applies the label filter, so it forwards the inner accessor's attribution untouched and
+    /// classifies the child. Overriding it is what lets a traced search reach the accessor that
+    /// actually knows rank — the default body would report every edge as unattributed.
+    async fn expand_beam_filtered_traced<Itr, P, F>(
+        &mut self,
+        ids: Itr,
+        pred: P,
+        mut on_neighbors: F,
+    ) -> ANNResult<()>
+    where
+        Itr: Iterator<Item = Self::Id> + Send,
+        P: glue::HybridPredicate<Self::Id> + Send + Sync,
+        F: FnMut(glue::TracedEdge<Self::Id, Decision<Self::Id>>) + Send,
+    {
+        self.inner
+            .expand_beam_traced(ids, pred, |edge| {
+                on_neighbors(glue::TracedEdge {
+                    parent: edge.parent,
+                    rank: edge.rank,
+                    parent_out_degree: edge.parent_out_degree,
+                    child: decide(self.labels, edge.child),
+                    dist: edge.dist,
+                    outcome: edge.outcome,
+                })
+            })
+            .await
+    }
+
     async fn expand_beam_accept_only<Itr, P, F>(
         &mut self,
         ids: Itr,

@@ -127,6 +127,26 @@ impl<I: NeighborPriorityQueueIdType> NeighborPriorityQueue<I> {
     /// The set cursor that is used to pop() the next item will be set to the lowest index of an unvisited item.
     /// Due to the performance sensitiveness of this function - we don't check for uniqueness of the item.
     /// Inserting the same item twice will cause undefined behavior.
+    /// Whether [`Self::insert`] would admit `nbr`, without mutating the queue.
+    ///
+    /// Exists for per-edge instrumentation: distinguishing "entered the frontier" from "was
+    /// evaluated and lost" is the whole point of recording an edge's outcome, and `insert` returns
+    /// nothing. A read-only predicate is preferred over making `insert` report its verdict so the
+    /// production hot path keeps its exact current shape.
+    ///
+    /// Deliberately placed immediately above `insert` and mirroring its two early returns
+    /// statement-for-statement: if that admission rule ever changes, the divergence is visible in
+    /// the same screenful rather than in a distant helper.
+    pub fn would_insert(&self, nbr: Neighbor<I>) -> bool {
+        if nbr.distance.is_nan() {
+            return false;
+        }
+        if self.auto_resizable {
+            return true;
+        }
+        !(self.size == self.capacity && self.get_unchecked(self.size - 1) < nbr)
+    }
+
     pub fn insert(&mut self, nbr: Neighbor<I>) {
         if nbr.distance.is_nan() {
             // We don't support NaN distances. If we see one, we ignore the insert since we can't determine where it belongs in the sorted order.

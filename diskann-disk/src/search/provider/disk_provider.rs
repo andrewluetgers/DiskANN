@@ -20,7 +20,10 @@ use diskann::{
         self,
         ext::labeled::{self, QueryLabelProvider},
         glue::{self, DefaultPostProcessor, SearchPostProcess, SearchStrategy},
-        search::{AdaptiveL, InlineFilterSearch, Knn},
+        search::{
+            record::{EdgeOutcome, RANK_UNATTRIBUTED},
+            AdaptiveL, InlineFilterSearch, Knn,
+        },
         search_output_buffer, DiskANNIndex,
     },
     neighbor::{Neighbor, NeighborPriorityQueue},
@@ -859,6 +862,117 @@ where
                 );
 
                 self.pq_distances(Some(i), &ids, &mut |dist, id| f(id, dist))?;
+            }
+
+            Ok(())
+        })();
+
+        std::future::ready(result)
+    }
+
+    /// Traced counterpart of [`Self::expand_beam`] — see
+    /// [`glue::SearchAccessor::expand_beam_traced`].
+    ///
+    /// This is the accessor that reads adjacency lists, so it is the only place that knows a
+    /// neighbour's rank and therefore the only place that can attribute an edge to a parent.
+    ///
+    /// Written as an explicit per-entry loop rather than reusing `expand_beam`'s iterator chain
+    /// because the two `filter`s in that chain are precisely where an edge is *dropped*, and a
+    /// traced run has to report the drops — they are the wasted IO the instrumentation exists to
+    /// quantify — instead of silently skipping them. `expand_beam` itself is left byte-for-byte
+    /// untouched so production carries no argument about whether the extra reporting optimises out.
+    fn expand_beam_traced<Itr, P, F>(
+        &mut self,
+        ids: Itr,
+        mut pred: P,
+        mut f: F,
+    ) -> impl std::future::Future<Output = ANNResult<()>> + Send
+    where
+        Itr: Iterator<Item = Self::Id> + Send,
+        P: glue::HybridPredicate<Self::Id> + Send + Sync,
+        F: FnMut(glue::TracedEdge<Self::Id, Self::Id>) + Send,
+    {
+        let result = (|| {
+            let io_limit = self.provider.search_io_limit - self.io_tracker.io_count();
+            let load_ids: Box<[_]> = ids.take(io_limit).collect();
+
+            self.ensure_loaded(&load_ids)?;
+            let mut ids = Vec::new();
+            // `(id, rank)` for entries that survived both filters, so rank can be recovered when
+            // `pq_distances` reports a distance. Looked up by id rather than by position because
+            // `pq_distances` makes no promise about callback ordering.
+            let mut ranked = Vec::new();
+            // Snapshot of the adjacency list: `get_adjacency_list` borrows `self.scratch`, and the
+            // `pq_distances` call below needs `&mut self`, so the borrow must end first.
+            let mut entries = Vec::new();
+            for i in load_ids {
+                ids.clear();
+                ranked.clear();
+                entries.clear();
+                let coded_mask = self.inline_coded_mask(&i)?;
+                {
+                    let adjacency = self.scratch.vertex_provider.get_adjacency_list(&i)?;
+                    entries.extend(adjacency.iter().copied());
+                }
+                // Ragged by design: mean 29.89, min 1, max 32 in the corpus this was built for, so
+                // this is the honest denominator for "what fraction of this node's edges paid off".
+                let parent_out_degree = u8::try_from(entries.len()).unwrap_or(u8::MAX);
+
+                for (rank, id) in entries.iter().copied().enumerate() {
+                    // `max_degree` is 32 in practice, so this is defensive, not expected.
+                    let rank_u8 = u8::try_from(rank).unwrap_or(RANK_UNATTRIBUTED);
+                    let carries_code = match coded_mask {
+                        Some(mask) => rank < INLINE_MAX_DEGREE && (mask >> rank) & 1 == 1,
+                        None => true,
+                    };
+                    if !carries_code {
+                        // Read out of the sector, then skipped before the predicate and before any
+                        // distance: terminal L0.
+                        f(glue::TracedEdge {
+                            parent: i,
+                            rank: rank_u8,
+                            parent_out_degree,
+                            child: id,
+                            dist: None,
+                            outcome: EdgeOutcome::Read,
+                        });
+                        continue;
+                    }
+                    if !pred.eval_mut(&id) {
+                        // On the search path the predicate is `NotInMut(visited)`, so a rejection
+                        // here is an already-visited node: the sector read was paid for and then
+                        // thrown away without even a distance computation. Pure wasted IO, and
+                        // invisible to `expand_beam`'s callback.
+                        f(glue::TracedEdge {
+                            parent: i,
+                            rank: rank_u8,
+                            parent_out_degree,
+                            child: id,
+                            dist: None,
+                            outcome: EdgeOutcome::AlreadyVisited,
+                        });
+                        continue;
+                    }
+                    ids.push(id);
+                    ranked.push((id, rank_u8));
+                }
+
+                self.pq_distances(Some(i), &ids, &mut |dist, id| {
+                    let rank = ranked
+                        .iter()
+                        .find(|(candidate, _)| *candidate == id)
+                        .map_or(RANK_UNATTRIBUTED, |(_, rank)| *rank);
+                    // Provisional: the frontier has not ruled on this edge yet. The search upgrades
+                    // this to FilterRejected / NotCloserThanFrontier / EnteredFrontier once it has.
+                    f(glue::TracedEdge {
+                        parent: i,
+                        rank,
+                        parent_out_degree,
+                        child: id,
+                        dist: Some(dist),
+                        outcome: EdgeOutcome::Read,
+                    });
+                })?;
             }
 
             Ok(())

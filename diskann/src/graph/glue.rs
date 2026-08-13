@@ -104,10 +104,43 @@ use futures_util::FutureExt;
 use crate::{
     ANNError, ANNResult,
     error::StandardError,
-    graph::{SearchOutputBuffer, workingset},
+    graph::{SearchOutputBuffer, search::record::EdgeOutcome, workingset},
     neighbor::Neighbor,
     provider::{self, DataProvider, HasId},
 };
+
+/// One adjacency entry as the traversal saw it, for the traced beam-expansion variants.
+///
+/// `C` is the child as the caller wants it: a bare `Self::Id` from
+/// [`SearchAccessor::expand_beam_traced`], or a [`Decision`] from
+/// [`FilteredAccessor::expand_beam_filtered_traced`] where the filter verdict is also known.
+///
+/// This exists because the untraced callbacks (`FnMut(Id, f32)` / `FnMut(Decision<Id>, f32)`)
+/// deliver neighbours already flattened across the beam, discarding both the parent and the
+/// adjacency position — which are exactly the two values the per-edge instrumentation measures.
+/// Carrying them in a struct rather than as four more positional callback arguments keeps the
+/// signature legible and avoids `clippy::too_many_arguments` at every call site.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TracedEdge<Id, C> {
+    /// The node whose adjacency list was being expanded.
+    pub parent: Id,
+    /// Position within `parent`'s adjacency list, 0-based, stored nearest-first.
+    /// [`RANK_UNATTRIBUTED`](crate::graph::search::record::RANK_UNATTRIBUTED) when the
+    /// implementor did not override the traced method and so cannot attribute the edge.
+    pub rank: u8,
+    /// `parent`'s actual out-degree. Ragged in real graphs, so it must be reported per node
+    /// rather than assumed to be `max_degree`. `0` means "not reported".
+    pub parent_out_degree: u8,
+    /// The neighbour the edge points at.
+    pub child: C,
+    /// Query-to-`child` distance, or `None` when the edge was discarded before any distance was
+    /// computed. `None` means "not measured", which is not the same as zero.
+    pub dist: Option<f32>,
+    /// How far this edge got *within the accessor*. Edges that reach the search are reported
+    /// provisionally as [`EdgeOutcome::Read`] and upgraded by the search once the frontier has
+    /// ruled on them; edges dropped inside the accessor carry their terminal outcome already.
+    pub outcome: EdgeOutcome,
+}
 
 /// The main extension point for graph search.
 ///
@@ -217,6 +250,45 @@ pub trait SearchAccessor: HasId + Send + Sync {
         Itr: Iterator<Item = Self::Id> + Send,
         P: HybridPredicate<Self::Id> + Send + Sync,
         F: FnMut(Self::Id, f32) + Send;
+
+    /// As [`Self::expand_beam`], but the callback also receives which parent each neighbour came
+    /// from and its position in that parent's adjacency list, plus adjacency entries that were
+    /// dropped *inside* the accessor and therefore never reach [`Self::expand_beam`]'s callback
+    /// at all (predicate rejections — i.e. already-visited nodes — and entries skipped before any
+    /// distance was computed).
+    ///
+    /// Diagnostic only. Production search calls [`Self::expand_beam`]; a traced run perturbs cache
+    /// and branch prediction and must not be used to report latency.
+    ///
+    /// # Default implementation
+    /// Delegates to [`Self::expand_beam`], reporting `parent = child`,
+    /// `rank = `[`RANK_UNATTRIBUTED`](crate::graph::search::record::RANK_UNATTRIBUTED) and
+    /// `parent_out_degree = 0`. Implementors that do not override this degrade to *unattributed*
+    /// edges rather than silently reporting a wrong parent, and dropped entries are simply not
+    /// reported. Only accessors that read adjacency lists themselves know rank, so only they
+    /// should override it.
+    fn expand_beam_traced<Itr, P, F>(
+        &mut self,
+        ids: Itr,
+        pred: P,
+        mut on_neighbors: F,
+    ) -> impl std::future::Future<Output = ANNResult<()>> + Send
+    where
+        Itr: Iterator<Item = Self::Id> + Send,
+        P: HybridPredicate<Self::Id> + Send + Sync,
+        F: FnMut(TracedEdge<Self::Id, Self::Id>) + Send,
+    {
+        self.expand_beam(ids, pred, move |id, dist| {
+            on_neighbors(TracedEdge {
+                parent: id,
+                rank: crate::graph::search::record::RANK_UNATTRIBUTED,
+                parent_out_degree: 0,
+                child: id,
+                dist: Some(dist),
+                outcome: EdgeOutcome::Read,
+            })
+        })
+    }
 
     //////////////////////
     // Provided methods //
@@ -446,6 +518,38 @@ pub trait FilteredAccessor: HasId + Send + Sync {
         Itr: Iterator<Item = Self::Id> + Send,
         P: HybridPredicate<Self::Id> + Send + Sync,
         F: FnMut(Decision<Self::Id>, f32) + Send;
+
+    /// As [`Self::expand_beam_filtered`], but the callback receives a [`TracedEdge`] carrying the
+    /// parent, the adjacency position, and entries dropped inside the accessor.
+    ///
+    /// Diagnostic only; see [`SearchAccessor::expand_beam_traced`].
+    ///
+    /// # Default implementation
+    /// Delegates to [`Self::expand_beam_filtered`] with `parent = child`,
+    /// `rank = `[`RANK_UNATTRIBUTED`](crate::graph::search::record::RANK_UNATTRIBUTED) and
+    /// `parent_out_degree = 0`, so unoverridden implementors degrade to unattributed edges.
+    fn expand_beam_filtered_traced<Itr, P, F>(
+        &mut self,
+        ids: Itr,
+        pred: P,
+        mut on_neighbors: F,
+    ) -> impl std::future::Future<Output = ANNResult<()>> + Send
+    where
+        Itr: Iterator<Item = Self::Id> + Send,
+        P: HybridPredicate<Self::Id> + Send + Sync,
+        F: FnMut(TracedEdge<Self::Id, Decision<Self::Id>>) + Send,
+    {
+        self.expand_beam_filtered(ids, pred, move |decision, dist| {
+            on_neighbors(TracedEdge {
+                parent: decision.into_inner(),
+                rank: crate::graph::search::record::RANK_UNATTRIBUTED,
+                parent_out_degree: 0,
+                child: decision,
+                dist: Some(dist),
+                outcome: EdgeOutcome::Read,
+            })
+        })
+    }
 
     /// This function is nearly identical to [`Self::expand_beam_filtered`], but
     /// implementors must ensure that only [`Accept`]ed IDs are passed to the callback.
