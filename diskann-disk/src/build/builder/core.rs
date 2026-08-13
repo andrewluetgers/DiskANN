@@ -1092,6 +1092,217 @@ pub(crate) mod disk_index_builder_tests {
         );
     }
 
+    /// End-to-end: build a shard whose disk-resident vectors are real Spherical-compressed bytes
+    /// (not fp32, and not the "same data disguised" trick the equivalence test above uses), then
+    /// search it and check recall against a brute-force ground truth. Ties together the write-side
+    /// mechanism (`build_with_alternate_disk_dataset`), real training/compression
+    /// (`spherical::iface::Impl`), the flatbuffers sidecar round-trip
+    /// (`Quantizer::serialize`/`load_spherical_sidecar`), and the read-side decode branch in
+    /// `RerankAndFilter::post_process` — the first test exercising the full pipeline together.
+    #[test]
+    fn test_spherical_compressed_shard_recall() {
+        use crate::data_model::AdHoc;
+        use crate::search::provider::{
+            disk_provider::{load_spherical_sidecar, DiskIndexSearcher},
+            disk_vertex_provider_factory::DiskVertexProviderFactory,
+        };
+        use crate::storage::disk_index_reader::DiskIndexReader;
+        use diskann_providers::storage::{get_compressed_pq_file, get_disk_index_file, get_pq_pivot_file};
+        use diskann_quantization::alloc::{GlobalAllocator, ScopedAllocator};
+        use diskann_quantization::algorithms::transforms::{TargetDim, TransformKind};
+        use diskann_quantization::spherical::iface::{Impl, Quantizer};
+        use diskann_quantization::spherical::{PreScale, SphericalQuantizer, SupportedMetric};
+        use diskann_utils::io::write_bin;
+        use diskann_utils::views::MatrixView;
+        use rand::{rngs::StdRng, SeedableRng};
+
+        const NBITS: usize = 4;
+        let index_path_prefix = format!("{}_spherical_e2e", INDEX_PATH_PREFIX);
+        let storage_provider = Arc::new(new_vfs());
+        let dim = 128; // matches TestParams::default() / TEST_DATA_FILE
+
+        // Real fp32 vectors from the standard SIFT test fixture.
+        let raw = read_bin::<f32>(&mut storage_provider.open_reader(TEST_DATA_FILE).unwrap()).unwrap();
+        let n = raw.nrows();
+        assert_eq!(raw.ncols(), dim);
+
+        // Train + compress every vector — same API validated in the standalone harness
+        // (~/dev/spherical-validation), same L2 metric as TestParams::default(). Unlike our real
+        // production data (already L2-normalized, mean_norm ~= 1.0), SIFT's raw fixture vectors
+        // have large, unnormalized magnitudes that overflow DataMeta's f16 correction fields at
+        // PreScale::None (hit this for real: `MetricSpecific { value: 100659.45 }`, past f16's
+        // ~65504 max) — ReciprocalMeanNorm rescales into the well-behaved range automatically.
+        let mut rng = StdRng::seed_from_u64(42);
+        let quantizer = SphericalQuantizer::<GlobalAllocator>::train(
+            MatrixView::try_from(raw.as_slice(), n, dim).unwrap(),
+            TransformKind::DoubleHadamard { target_dim: TargetDim::Same },
+            SupportedMetric::SquaredL2,
+            PreScale::ReciprocalMeanNorm,
+            &mut rng,
+            GlobalAllocator,
+        )
+        .unwrap();
+        let plan: Impl<NBITS> = Impl::new(quantizer).unwrap();
+        let bytes_per_vec = Quantizer::<GlobalAllocator>::bytes(&plan);
+
+        let mut compressed = vec![0u8; n * bytes_per_vec];
+        for i in 0..n {
+            let x = &raw.as_slice()[i * dim..(i + 1) * dim];
+            let into = diskann_quantization::spherical::iface::OpaqueMut::new(
+                &mut compressed[i * bytes_per_vec..(i + 1) * bytes_per_vec],
+            );
+            Quantizer::<GlobalAllocator>::compress(&plan, x, into, ScopedAllocator::global())
+                .unwrap();
+        }
+
+        // Write the compressed dataset in the same .fbin shape the vendor dataset reader expects
+        // (write_bin's 8-byte npoints/ndims header + raw bytes) — "ndims" here is bytes_per_vec,
+        // since each compressed vector is being fed through as an AdHoc<u8,u32> "vector".
+        let compressed_dataset_path = format!("{}_compressed_dataset.fbin", index_path_prefix);
+        {
+            let mut writer = storage_provider
+                .create_for_write(&compressed_dataset_path)
+                .unwrap();
+            write_bin::<u8>(
+                MatrixView::try_from(compressed.as_slice(), n, bytes_per_vec).unwrap(),
+                &mut writer,
+            )
+            .unwrap();
+        }
+
+        // Build: graph + PQ from the real fp32 data (unchanged quality), final disk layout
+        // embeds the compressed bytes instead.
+        let disk_index_build_parameters = DiskIndexBuildParameters::new(
+            MemoryBudget::try_from_gb(1.0).unwrap(),
+            QuantizationType::FP,
+            NumPQChunks::new_with(dim, dim).unwrap(),
+        );
+        let config = config::Builder::new_with(
+            16,
+            config::MaxDegree::default_slack(),
+            64,
+            L2.into(),
+            |b| {
+                b.saturate_after_prune(true);
+            },
+        )
+        .build()
+        .unwrap();
+        let index_configuration = IndexConfiguration::new(L2, dim, n, ONE, 1, config)
+            .with_pseudo_rng_from_seed(100);
+        let disk_index_writer = DiskIndexWriter::new(
+            TEST_DATA_FILE.to_string(),
+            index_path_prefix.clone(),
+            None,
+            DEFAULT_DISK_SECTOR_LEN,
+        )
+        .unwrap();
+        let mut disk_index = DiskIndexBuilder::<GraphDataF32VectorUnitData, _>::new(
+            storage_provider.as_ref(),
+            disk_index_build_parameters,
+            index_configuration,
+            disk_index_writer,
+        )
+        .unwrap();
+        disk_index
+            .build_with_alternate_disk_dataset::<AdHoc<u8, u32>>(&compressed_dataset_path)
+            .unwrap();
+
+        // Persist the trained quantizer via the crate's own flatbuffers round-trip.
+        let sidecar_bytes = Quantizer::<GlobalAllocator>::serialize(&plan, GlobalAllocator).unwrap();
+        {
+            let mut writer = storage_provider
+                .create_for_write(&format!("{}_spherical.bin", index_path_prefix))
+                .unwrap();
+            std::io::Write::write_all(&mut writer, &sidecar_bytes).unwrap();
+        }
+
+        // Open a real searcher over the Spherical-compressed shard.
+        let index_reader = DiskIndexReader::new(
+            get_pq_pivot_file(&index_path_prefix),
+            get_compressed_pq_file(&index_path_prefix),
+            storage_provider.as_ref(),
+        )
+        .unwrap();
+        let vertex_provider_factory = DiskVertexProviderFactory::new(
+            VirtualAlignedReaderFactory::new(
+                get_disk_index_file(&index_path_prefix),
+                Arc::clone(&storage_provider),
+            ),
+            CachingStrategy::None,
+        )
+        .unwrap();
+        let spherical = load_spherical_sidecar(storage_provider.as_ref(), &index_path_prefix)
+            .unwrap()
+            .expect("sidecar was just written");
+        let search_engine = DiskIndexSearcher::<
+            AdHoc<u8, u32>,
+            DiskVertexProviderFactory<AdHoc<u8, u32>, _>,
+        >::new(
+            1,
+            u32::MAX as usize,
+            &index_reader,
+            vertex_provider_factory,
+            L2,
+            None,
+            Some(spherical),
+        )
+        .unwrap();
+
+        // Recall@10 against brute-force ground truth on real full-precision vectors, using the
+        // Spherical-compressed query bytes (symmetric comparison, matching the read-side design).
+        let top_k = 10;
+        let mut hits = 0usize;
+        let mut total = 0usize;
+        for (q, query_data) in raw.row_iter().enumerate().take(50) {
+            let gt = diskann_providers::test_utils::groundtruth(raw.as_view(), query_data, |a, b| {
+                let mut acc = 0f32;
+                for i in 0..dim {
+                    let d = a[i] - b[i];
+                    acc += d * d;
+                }
+                acc
+            });
+
+            let mut query_compressed = vec![0u8; bytes_per_vec];
+            Quantizer::<GlobalAllocator>::compress(
+                &plan,
+                query_data,
+                diskann_quantization::spherical::iface::OpaqueMut::new(&mut query_compressed),
+                ScopedAllocator::global(),
+            )
+            .unwrap();
+
+            let mut query_stats = QueryStatistics::default();
+            let mut indices = vec![0u32; top_k];
+            let mut distances = vec![0f32; top_k];
+            let mut associated_data = vec![(); top_k];
+
+            let _ = search_engine.search_internal(
+                &query_compressed,
+                top_k,
+                32,
+                None,
+                &mut query_stats,
+                &mut indices,
+                &mut distances,
+                &mut associated_data,
+                &crate::search::search_mode::SearchMode::graph(),
+            );
+
+            let gt_ids: std::collections::HashSet<u32> = gt.iter().take(top_k).map(|n| n.id).collect();
+            hits += indices.iter().filter(|i| gt_ids.contains(i)).count();
+            total += top_k;
+            let _ = q;
+        }
+
+        let recall = hits as f64 / total as f64;
+        assert!(
+            recall > 0.5,
+            "expected meaningfully-above-chance recall for a 4-bit Spherical-compressed shard, got {recall}"
+        );
+    }
+
     #[test]
     fn test_build_from_iter_merged_index() {
         // Use the same parameters from [test_sift_build_and_search] in diskann_index
@@ -1189,6 +1400,7 @@ pub(crate) mod disk_index_builder_tests {
             vertex_provider_factory,
             params.metric,
             None,
+            None, // spherical: this fixture never builds Spherical-mode shards
         )?;
 
         let data =

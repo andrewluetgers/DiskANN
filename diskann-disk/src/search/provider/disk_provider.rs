@@ -42,6 +42,8 @@ use diskann_utils::{
 };
 
 use crate::search::pq::{quantizer_preprocess, PQData, PQScratch};
+use diskann_quantization::alloc::{GlobalAllocator, Poly};
+use diskann_quantization::spherical;
 use diskann_vector::{distance::Metric, DistanceFunction};
 use tokio::runtime::Runtime;
 use tracing::debug;
@@ -88,7 +90,21 @@ where
 
     /// The number of IO operations that can be done in parallel.
     search_io_limit: usize,
+
+    /// When present, `Data::VectorDataType` is raw bytes of a Spherical-compressed vector (not a
+    /// meaningful full-precision type on its own) and `distance_comparer` must not be used for
+    /// rerank — the trained quantizer here decodes those bytes instead. Loaded once at shard-open
+    /// from a `<prefix>_spherical.bin` sidecar via the flatbuffers round-trip this crate already
+    /// ships (`spherical::iface::{Quantizer::serialize, try_deserialize}`) — NOT reconstructed
+    /// from stored parameters, since `Transform`s like `DoubleHadamard` have genuine random state
+    /// (e.g. diagonal signs) that must match exactly what was used to compress, not just be
+    /// regenerated from the same `TransformKind`.
+    spherical: Option<Poly<SphericalQuantizer, GlobalAllocator>>,
 }
+
+/// Alias for the trait object `try_deserialize` hands back — kept short since it appears in a
+/// couple of signatures below.
+type SphericalQuantizer = dyn spherical::iface::Quantizer<GlobalAllocator>;
 
 impl<Data> DataProvider for DiskProvider<Data>
 where
@@ -166,12 +182,15 @@ where
             provider,
         )?;
 
+        let spherical = load_spherical_sidecar(provider, index_path_prefix)?;
+
         Self::new(
             &index_reader,
             graph_header,
             metric,
             num_points,
             ctx.search_io_limit,
+            spherical,
         )
     }
 }
@@ -180,12 +199,14 @@ impl<Data> DiskProvider<Data>
 where
     Data: GraphDataType<VectorIdType = u32>,
 {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         disk_index_reader: &DiskIndexReader,
         graph_header: GraphHeader,
         metric: Metric,
         num_points: usize,
         search_io_limit: usize,
+        spherical: Option<Poly<SphericalQuantizer, GlobalAllocator>>,
     ) -> ANNResult<Self> {
         let distance_comparer =
             Data::VectorDataType::distance(metric, Some(graph_header.metadata().dims));
@@ -199,8 +220,32 @@ where
             num_points,
             metric,
             search_io_limit,
+            spherical,
         })
     }
+}
+
+/// Load a `<prefix>_spherical.bin` sidecar if present, via the crate's own flatbuffers round-trip
+/// (`spherical::iface::try_deserialize`) — returns `Ok(None)` (not an error) when the shard simply
+/// doesn't use Spherical storage, matching the existing optional-artifact pattern for PQ files.
+pub fn load_spherical_sidecar<P: StorageReadProvider>(
+    provider: &P,
+    index_path_prefix: &str,
+) -> ANNResult<Option<Poly<SphericalQuantizer, GlobalAllocator>>> {
+    let sidecar_path = format!("{index_path_prefix}_spherical.bin");
+    if !provider.exists(&sidecar_path) {
+        return Ok(None);
+    }
+    let mut reader = provider.open_reader(&sidecar_path)?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut bytes)
+        .map_err(|e| ANNError::log_index_error(format!("reading {sidecar_path}: {e}")))?;
+    let quantizer = spherical::iface::try_deserialize::<GlobalAllocator, GlobalAllocator>(
+        &bytes,
+        GlobalAllocator,
+    )
+    .map_err(|e| ANNError::log_index_error(format!("deserializing {sidecar_path}: {e}")))?;
+    Ok(Some(quantizer))
 }
 
 /// The search strategy for the disk provider. This is used to create the search accessor
@@ -373,9 +418,38 @@ where
         };
         if !uncached_ids.is_empty() {
             ensure_vertex_loaded(&mut accessor.scratch.vertex_provider, &uncached_ids)?;
+
+            // When present, Data::VectorDataType is raw Spherical-compressed bytes (not a
+            // meaningful full-precision type), so provider.distance_comparer must not be used —
+            // decode via the trained quantizer instead. Symmetric (compressed query vs compressed
+            // data) rather than the asymmetric preprocessed-query form, since `query` has already
+            // been reduced to Data::VectorDataType by the time it reaches here — a known,
+            // documented simplification for this pass; asymmetric query support (which measured
+            // higher recall in the standalone validation harness) is a follow-up, not silently
+            // assumed to already match those numbers.
+            let spherical_distance = match &provider.spherical {
+                Some(quantizer) => Some(
+                    quantizer
+                        .distance_computer(GlobalAllocator)
+                        .map_err(|e| ANNError::log_index_error(format!("{e}")))?,
+                ),
+                None => None,
+            };
+
             for n in &uncached_ids {
                 let v = accessor.scratch.vertex_provider.get_vector(n)?;
-                let d = provider.distance_comparer.evaluate_similarity(query, v);
+                let d = match &spherical_distance {
+                    Some(dc) => {
+                        let query_bytes: &[u8] = bytemuck::cast_slice(query);
+                        let data_bytes: &[u8] = bytemuck::cast_slice(v);
+                        dc.evaluate_similarity(
+                            spherical::iface::Opaque::new(query_bytes),
+                            spherical::iface::Opaque::new(data_bytes),
+                        )
+                        .map_err(|e| ANNError::log_index_error(format!("{e}")))?
+                    }
+                    None => provider.distance_comparer.evaluate_similarity(query, v),
+                };
                 let a = accessor.scratch.vertex_provider.get_associated_data(n)?;
                 reranked.push(((*n, *a), d));
             }
@@ -865,6 +939,11 @@ where
     /// * `vertex_provider_factory` - The vertex provider factory.
     /// * `metric` - Distance metric used for vector similarity calculations.
     /// * `runtime` - Tokio runtime handle for executing async operations.
+    /// * `spherical` - Trained Spherical quantizer for shards whose disk-resident vector bytes
+    ///   are Spherical-compressed rather than full precision (`None` for ordinary shards). Caller
+    ///   loads this the same way it loads `disk_index_reader` — from the shard's own path prefix
+    ///   (`load_spherical_sidecar` if reading from disk).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         num_threads: usize,
         search_io_limit: usize,
@@ -872,6 +951,7 @@ where
         vertex_provider_factory: ProviderFactory,
         metric: Metric,
         runtime: Option<Runtime>,
+        spherical: Option<Poly<SphericalQuantizer, GlobalAllocator>>,
     ) -> ANNResult<Self> {
         let runtime = match runtime {
             Some(rt) => rt,
@@ -910,6 +990,7 @@ where
             metric,
             metadata.num_pts.into_usize(),
             search_io_limit,
+            spherical,
         )?;
 
         let index = DiskANNIndex::new(config, disk_provider, NonZeroUsize::new(num_threads));
@@ -1512,6 +1593,7 @@ mod disk_provider_tests {
             vertex_provider_factory,
             Metric::L2,
             Some(runtime),
+            None,
         )
         .unwrap()
     }
