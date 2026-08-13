@@ -113,8 +113,24 @@ where
     ///   so the denominator for "what fraction of this node's edges were useful" must be recorded
     ///   per node rather than assumed to be `max_degree`.
     /// - `child`: the neighbour the edge points at.
-    /// - `dist`: query-to-`child` distance, or `None` when the edge was discarded before any
-    ///   distance was computed. `None` means "not measured", which is not the same as zero.
+    /// - `dist`: **PQ-approximate, query-to-`child`** distance, or `None` when the edge was
+    ///   discarded before any distance was computed. `None` means "not measured", which is not the
+    ///   same as zero.
+    ///
+    ///   Two qualifications matter, and conflating either with a true metric distance will corrupt
+    ///   any analysis built on this:
+    ///
+    ///   1. **It is quantized, not exact.** On the disk path this is a PQ distance-table lookup —
+    ///      the approximation the walk actually steers on. That is a feature, not a shortcoming:
+    ///      it is the only distance the traversal ever computes, and the gap between it and the
+    ///      true distance is exactly why overfetch and re-ranking exist. But it is not the metric.
+    ///   2. **It is query-to-child, not parent-to-child.** It is not the edge's length in
+    ///      embedding space; the search has no reason to compute that and does not.
+    ///
+    ///   Both exact quantities are recoverable offline by joining `parent`/`child` against the
+    ///   corpus vectors, which is where they belong — a traced search must not be made to compute
+    ///   full-precision distances it would not otherwise touch, or it stops describing the real
+    ///   search.
     /// - `outcome`: the terminal [`EdgeOutcome`] for this edge.
     /// - `hop`: the beam iteration during which the edge was read.
     ///
