@@ -7,8 +7,68 @@ use std::fmt::Display;
 
 use crate::neighbor::Neighbor;
 
+/// How far up the "usefulness ladder" a single traversed out-link got.
+///
+/// Ordered so that a larger discriminant implies every weaker condition also held: an edge that
+/// reached [`EdgeOutcome::ExpandedAsBeam`] necessarily also entered the frontier, passed the filter
+/// and was not a duplicate. Each variant is the *terminal* state recorded for that edge.
+///
+/// The point of separating these rather than recording a single "useful" bool is that they imply
+/// different actions: `AlreadyVisited` is pure wasted IO (the adjacency entry was read and then
+/// discarded without even a distance computation), whereas `NotCloserThanFrontier` means the edge
+/// was genuinely evaluated and simply lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum EdgeOutcome {
+    /// L0 only: the adjacency entry was read but skipped before any further work.
+    Read = 0,
+    /// L1 failed: the neighbour was already visited, so no distance was computed. Wasted IO.
+    AlreadyVisited = 1,
+    /// L2 failed: distance computed, but the inline filter rejected the neighbour.
+    FilterRejected = 2,
+    /// L3 failed: passed the filter but was not close enough to enter the candidate list.
+    NotCloserThanFrontier = 3,
+    /// L3: entered the candidate list, i.e. it improved the frontier.
+    EnteredFrontier = 4,
+    /// L4: was later popped as a beam node, i.e. it actually steered the walk.
+    ExpandedAsBeam = 5,
+}
+
+impl EdgeOutcome {
+    /// Number of distinct outcomes, for sizing fixed histogram arrays without a HashMap.
+    pub const COUNT: usize = 6;
+
+    /// Discriminant as an index into such an array.
+    pub fn as_index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Sentinel `rank` meaning "this edge was not attributed to a parent/position".
+///
+/// Deliberately `u8::MAX` rather than `0`: rank 0 is a real and highly meaningful value (the
+/// nearest neighbour, which is the true nearest neighbour ~97% of the time in the corpus this was
+/// built for), so conflating "unknown" with "nearest" would corrupt exactly the per-rank histogram
+/// this instrumentation exists to produce. Chosen over `Option<u8>` to keep the hot-path callback
+/// signature branch-free.
+pub const RANK_UNATTRIBUTED: u8 = u8::MAX;
+
 /// A logger provided to various search tasks
-pub trait SearchRecord<T>: Send + Sync + 'static
+///
+/// # Why no `'static` supertrait
+/// This originally read `Send + Sync + 'static`. The `'static` was relaxed so a *borrowed*
+/// diagnostic sink can be attached to a single search
+/// ([`InlineFilterSearch::with_edge_record`](super::InlineFilterSearch::with_edge_record)): with
+/// `'static` in the supertrait, `dyn SearchRecord<T>` is implicitly `dyn SearchRecord<T> + 'static`,
+/// so `&'r mut dyn SearchRecord<T>` forces `'r: 'static` and a sink holding any borrowed state
+/// (e.g. a slice of per-vector routing ids) cannot be passed in at all.
+///
+/// This is a *relaxation*, so every existing implementor still satisfies it — `NoopSearchRecord`,
+/// `VisitedSearchRecord` and `RecallSearchRecord` are all `'static` regardless. Only code that
+/// requires `SR: 'static` (e.g. spawning the search future onto an executor rather than awaiting
+/// it in place) would notice, and that would surface as a compile error at the call site rather
+/// than as a runtime problem.
+pub trait SearchRecord<T>: Send + Sync
 where
     T: Eq,
 {
@@ -25,6 +85,39 @@ where
     /// # Type Parameters
     /// - `T`: The data type associated with the neighbor.
     fn record(&mut self, _neighbor: Neighbor<T>, _hops: u32, _cmps: u32) {
+        // Default no-op implementation
+    }
+
+    /// Records one traversed out-link: which edge it was, and how useful it turned out to be.
+    ///
+    /// # Parameters
+    /// - `parent`: the node whose adjacency list was being expanded.
+    /// - `rank`: position within that adjacency list, 0-based, in the stored nearest-first order.
+    ///   [`RANK_UNATTRIBUTED`] when the caller could not attribute the edge.
+    /// - `parent_out_degree`: how many out-links `parent` actually had. Not a constant — real
+    ///   graphs have ragged degree (mean 29.89, min 1, max 32 in the corpus this was written for),
+    ///   so the denominator for "what fraction of this node's edges were useful" must be recorded
+    ///   per node rather than assumed to be `max_degree`.
+    /// - `child`: the neighbour the edge points at.
+    /// - `dist`: query-to-`child` distance, or `None` when the edge was discarded before any
+    ///   distance was computed. `None` means "not measured", which is not the same as zero.
+    /// - `outcome`: the terminal [`EdgeOutcome`] for this edge.
+    /// - `hop`: the beam iteration during which the edge was read.
+    ///
+    /// # Default Implementation
+    /// A no-op, so existing implementors are unaffected and [`NoopSearchRecord`] monomorphises
+    /// this away entirely rather than paying a branch per edge.
+    #[allow(clippy::too_many_arguments)]
+    fn record_edge(
+        &mut self,
+        _parent: T,
+        _rank: u8,
+        _parent_out_degree: u8,
+        _child: T,
+        _dist: Option<f32>,
+        _outcome: EdgeOutcome,
+        _hop: u16,
+    ) {
         // Default no-op implementation
     }
 }

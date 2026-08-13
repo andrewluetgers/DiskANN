@@ -76,31 +76,72 @@ impl AdaptiveL {
 ///     specificity = 1%   (10/1000)  → 4× L
 ///     specificity = 0.1% (1/1000)   → 8× L
 ///   and so on up to a pre-set maximum multiplier
-#[derive(Debug)]
-pub struct InlineFilterSearch {
+/// `I` is the vertex-id type of the accessor this search will run against (`u32` on every disk
+/// path, hence the default). It is a parameter only so the optional diagnostic sink can be typed;
+/// with no sink attached it is inferred from the accessor and costs nothing.
+pub struct InlineFilterSearch<'r, I = u32> {
     /// Base graph search parameters.
     pub inner: Knn,
     /// Adaptive L for the search.
     pub adaptive_l: Option<AdaptiveL>,
+    /// Optional per-edge diagnostic sink. `None` (the default, and what every production path
+    /// uses) means the traversal runs against `NoopSearchRecord`, whose empty default method
+    /// bodies monomorphise away — so an absent sink costs nothing, not even a branch.
+    ///
+    /// Borrowed rather than owned so the caller keeps the sink and can drain it after the search
+    /// returns. `inline_filter_search_internal` accepts `SR: ?Sized`, so a `dyn` sink needs no
+    /// further plumbing.
+    pub edge_record: Option<&'r mut (dyn SearchRecord<I> + 'r)>,
 }
 
-impl InlineFilterSearch {
-    /// Create new inline filter search parameters.
-    pub fn new(inner: Knn, adaptive_l: Option<AdaptiveL>) -> Self {
-        Self { inner, adaptive_l }
+// Hand-written rather than derived: `dyn SearchRecord` is not `Debug`, so `#[derive(Debug)]` on the
+// struct above would not compile. The sink is reported as present/absent, which is the only part
+// worth printing anyway.
+impl<I> std::fmt::Debug for InlineFilterSearch<'_, I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InlineFilterSearch")
+            .field("inner", &self.inner)
+            .field("adaptive_l", &self.adaptive_l)
+            .field("edge_record", &self.edge_record.is_some())
+            .finish()
     }
 }
 
-impl<'a, DP, S, T> Search<'a, DP, S, T> for InlineFilterSearch
+impl<'r, I> InlineFilterSearch<'r, I> {
+    /// Create new inline filter search parameters.
+    pub fn new(inner: Knn, adaptive_l: Option<AdaptiveL>) -> Self {
+        Self {
+            inner,
+            adaptive_l,
+            edge_record: None,
+        }
+    }
+
+    /// Attach a per-edge diagnostic sink. Diagnostic-only: see the note on
+    /// [`SearchRecord::record_edge`]. A traced run must not be used to report latency, because
+    /// even a counter-only sink perturbs cache and branch prediction.
+    pub fn with_edge_record(mut self, sink: &'r mut (dyn SearchRecord<I> + 'r)) -> Self {
+        self.edge_record = Some(sink);
+        self
+    }
+}
+
+// The sink's id type is pinned to `DP::InternalId` rather than left free: the search scratch is
+// `SearchScratch<DP::InternalId>`, and `inline_filter_search_internal` requires the accessor's `Id`
+// and the scratch's id to be the same type. That equality was always implicit in this impl (it is
+// how the original type-checked); binding it explicitly is what lets a `dyn SearchRecord<_>` sink
+// be typed here at all.
+impl<'a, DP, S, T> Search<'a, DP, S, T> for InlineFilterSearch<'_, DP::InternalId>
 where
     DP: DataProvider,
-    S: SearchStrategy<'a, DP, T, SearchAccessor: FilteredAccessor>,
+    S: SearchStrategy<'a, DP, T, SearchAccessor: FilteredAccessor<Id = DP::InternalId>>,
     T: Copy + Send + Sync,
+    DP::InternalId: VectorId,
 {
     type Output = SearchStats;
 
     fn search<O, PP, OB>(
-        self,
+        mut self,
         index: &'a DiskANNIndex<DP>,
         strategy: &'a S,
         processor: PP,
@@ -122,6 +163,16 @@ where
 
             let mut scratch = index.search_scratch(self.inner.l_value().get(), num_starting_points);
 
+            // `inline_filter_search_internal` is generic over `SR: ?Sized`, so the same call
+            // serves both a monomorphised `NoopSearchRecord` (production: empty bodies inline
+            // away) and a `dyn` diagnostic sink. Taking the sink by `Option::take` leaves `self`
+            // usable and avoids requiring `SearchRecord: Sized`.
+            let mut noop = NoopSearchRecord::new();
+            let record: &mut (dyn SearchRecord<DP::InternalId> + '_) = match self.edge_record.take()
+            {
+                Some(sink) => sink,
+                None => &mut noop,
+            };
             let Ret {
                 cmps,
                 hops,
@@ -131,7 +182,7 @@ where
                 &self.inner,
                 &mut accessor,
                 &mut scratch,
-                &mut NoopSearchRecord::new(),
+                record,
                 self.adaptive_l,
             )
             .await?;
