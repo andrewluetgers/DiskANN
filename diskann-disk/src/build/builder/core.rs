@@ -198,193 +198,16 @@ where
         output_vamana: String,
         rng: &mut impl Rng,
     ) -> ANNResult<()> {
-        // Read ID maps
-        let mut vamana_names = vec![String::new(); num_parts];
-        let mut id_maps: Vec<Vec<u32>> = vec![Vec::new(); num_parts];
-        for shard in 0..num_parts {
-            vamana_names[shard] = DiskIndexWriter::get_merged_index_subshard_mem_index_file(
-                merged_index_prefix,
-                shard,
-            );
-
-            let id_maps_file =
-                DiskIndexWriter::get_merged_index_subshard_id_map_file(merged_index_prefix, shard);
-            id_maps[shard] = self.read_idmap(id_maps_file)?;
-        }
-
-        // find max node id
-        let num_nodes: u32 = *id_maps.iter().flatten().max().unwrap_or(&0) + 1;
-        let num_elements: u32 = id_maps.iter().map(|idmap| idmap.len() as u32).sum();
-        info!("# nodes: {}, max degree: {}", num_nodes, max_degree);
-
-        // compute inverse map: node -> shards
-        let mut node_shard: Vec<(u32, u32)> = Vec::with_capacity(num_elements as usize);
-        for (shard, id_map) in id_maps.iter().enumerate() {
-            info!("Creating inverse map -- shard #{}", shard);
-            node_shard.extend(id_map.iter().map(|node_id| (*node_id, shard as u32)));
-        }
-        node_shard.sort_unstable_by(|left, right| {
-            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
-        });
-
-        info!("Finished computing node -> shards map");
-
-        // create cached vamana readers
-        let mut vamana_readers = Vec::new();
-        for name in &vamana_names {
-            let reader = CachedReader::<StorageProvider>::new(
-                name,
-                READ_WRITE_BLOCK_SIZE,
-                self.storage_provider,
-            )?;
-            vamana_readers.push(reader);
-        }
-
-        // create cached vamana writers
-        let mut merged_vamana_cached_writer = CachedWriter::<StorageProvider>::new(
-            &output_vamana,
-            READ_WRITE_BLOCK_SIZE,
-            self.storage_provider.create_for_write(&output_vamana)?,
-        )?;
-
-        // expected file size + max degree + medoid_id + frozen_point info
-        let vamana_metadata_size =
-            size_of::<u64>() + size_of::<u32>() + size_of::<u32>() + size_of::<u64>();
-
-        // we initialize the size of the merged index to the metadata size
-        // we will overwrite the index size at the end
-        let mut merged_index_size: u64 = vamana_metadata_size as u64;
-        merged_vamana_cached_writer.write(&merged_index_size.to_le_bytes())?;
-
-        let mut read_buf_8_bytes = [0u8; 8];
-
-        // get max input width
-        let mut max_input_width = 0;
-        // read width from each vamana to advance buffer by sizeof(uint32_t) bytes
-        for reader in &mut vamana_readers {
-            reader.read(&mut read_buf_8_bytes)?;
-            let _expected_file_size: u64 = u64::from_le_bytes(read_buf_8_bytes);
-            let input_width = reader.read_u32()?;
-            max_input_width = input_width.max(max_input_width);
-        }
-
-        // write max_degree to merged_vamana_index
-        let output_width: u32 = max_degree;
-        info!(
-            "Max input width: {}, output width: {}",
-            max_input_width, output_width
-        );
-
-        merged_vamana_cached_writer.write(&output_width.to_le_bytes())?;
-
-        // write medoid to merged_vamana_index
-        for shard in 0..num_parts {
-            // read medoid
-            let mut medoid: u32 = vamana_readers[shard].read_u32()?;
-            vamana_readers[shard].read(&mut read_buf_8_bytes)?;
-            let vamana_index_frozen: u64 = u64::from_le_bytes(read_buf_8_bytes);
-            debug_assert_eq!(vamana_index_frozen, 0);
-
-            // rename medoid
-            medoid = id_maps[shard][medoid as usize];
-
-            // write renamed medoid
-            if shard == (num_parts - 1) {
-                // uncomment if running hierarchical
-                merged_vamana_cached_writer.write(&medoid.to_le_bytes())?;
-            }
-        }
-
-        let vamana_index_frozen: u64 = 0; // as of now the functionality to merge many overlapping vamana
-                                          // indices is supported only for bulk indices without frozen point.
-                                          // Hence the final index will also not have any frozen points.
-        merged_vamana_cached_writer.write(&vamana_index_frozen.to_le_bytes())?;
-
-        info!("Starting merge");
-
-        let mut nbr_set = vec![false; num_nodes as usize];
-        let mut final_nbrs: Vec<u32> = Vec::new();
-        let mut cur_id = 0;
-        for pair in &node_shard {
-            let (node_id, shard_id) = *pair;
-            if cur_id < node_id {
-                final_nbrs.shuffle(rng);
-
-                let nnbrs: u32 = std::cmp::min(final_nbrs.len() as u32, max_degree);
-                merged_vamana_cached_writer.write(&nnbrs.to_le_bytes())?;
-
-                let bytes = final_nbrs
-                    .iter()
-                    .take(nnbrs as usize)
-                    .flat_map(|x| x.to_le_bytes())
-                    .collect::<Vec<u8>>();
-                merged_vamana_cached_writer.write(&bytes)?;
-
-                merged_index_size += (size_of::<u32>() + nnbrs as usize * size_of::<u32>()) as u64;
-                if cur_id % 499999 == 1 {
-                    print!(".");
-                }
-                cur_id = node_id;
-
-                final_nbrs.iter().for_each(|p| nbr_set[*p as usize] = false);
-                final_nbrs.clear();
-            }
-
-            // read num of neighbors from vamana index
-            let num_nbrs = vamana_readers[shard_id as usize].read_u32()?;
-
-            if num_nbrs == 0 {
-                info!(
-                    "WARNING: shard #{}, node_id {} has 0 nbrs",
-                    shard_id, node_id
-                );
-            } else {
-                let mut nbrs_bytes = vec![0u8; num_nbrs as usize * mem::size_of::<u32>()];
-                vamana_readers[shard_id as usize].read(&mut nbrs_bytes)?;
-                let nbrs: &[u32] = bytemuck::cast_slice(&nbrs_bytes);
-
-                // rename nodes
-                for j in 0..num_nbrs {
-                    let nbr = nbrs[j as usize];
-                    let renamed_node = id_maps[shard_id as usize][nbr as usize];
-                    if !nbr_set[renamed_node as usize] {
-                        nbr_set[renamed_node as usize] = true;
-                        final_nbrs.push(renamed_node);
-                    }
-                }
-            }
-        }
-
-        // write the last node, to be refactored...
-        final_nbrs.shuffle(rng);
-
-        let nnbrs: u32 = std::cmp::min(final_nbrs.len() as u32, max_degree);
-        merged_vamana_cached_writer.write(&nnbrs.to_le_bytes())?;
-
-        let bytes = final_nbrs
-            .iter()
-            .take(nnbrs as usize)
-            .flat_map(|x| x.to_le_bytes())
-            .collect::<Vec<u8>>();
-        merged_vamana_cached_writer.write(&bytes)?;
-
-        merged_index_size += (size_of::<u32>() + nnbrs as usize * size_of::<u32>()) as u64;
-
-        nbr_set.clear();
-        final_nbrs.clear();
-
-        info!("Expected size: {}", merged_index_size);
-        merged_vamana_cached_writer.reset()?;
-        merged_vamana_cached_writer.write(&merged_index_size.to_le_bytes())?;
-
-        info!("Finished merge");
-        Ok(())
+        merge_vamana_shards(
+            self.storage_provider,
+            merged_index_prefix,
+            num_parts,
+            max_degree,
+            output_vamana,
+            rng,
+        )
     }
 
-    fn read_idmap(&self, idmaps_path: String) -> Result<Vec<u32>, diskann_utils::io::ReadBinError> {
-        let data = read_bin::<u32>(&mut self.storage_provider.open_reader(&idmaps_path)?)?;
-        Ok(data.into_inner().into_vec())
-    }
 
     fn merge_shards_and_cleanup(
         &self,
@@ -425,6 +248,264 @@ where
 
         Ok(())
     }
+}
+
+/// Merge per-shard Vamana graphs into one graph over the union of their nodes.
+///
+/// Lifted verbatim out of [`DiskIndexBuilderCore::merge_shards`] (which now delegates here) so the
+/// merge is reachable without constructing a whole disk-index builder -- the point being to feed it
+/// shard graphs built elsewhere, e.g. on the GPU by cuVS, whose `vamana.save()` output is
+/// byte-compatible with the 24-byte header this reads.
+///
+/// Reads, for `shard` in `0..num_parts`:
+/// - `{merged_index_prefix}_subshard-{shard}_ids_uint32.bin` -- the shard's id map, shard-local
+///   index -> global id. **Must be ascending**: the merge walks nodes in global-id order and reads
+///   each shard's graph sequentially, so the two orders have to agree.
+/// - `{merged_index_prefix}_subshard-{shard}_mem.index` -- the shard's graph.
+///
+/// Writes `output_vamana`. Every node's unioned neighbour set is **shuffled** and then truncated to
+/// `max_degree`, so a node appearing in more than one shard keeps a random subset of its candidate
+/// edges rather than the nearest ones -- inherent to this implementation, and one of the things a
+/// stitched-vs-single-shot comparison is measuring.
+///
+/// Unlike `merge_shards_and_cleanup`, this deletes nothing: the per-shard graphs and id maps are
+/// left in place.
+pub fn merge_vamana_shards<StorageProvider>(
+    storage_provider: &StorageProvider,
+    merged_index_prefix: &str,
+    num_parts: usize,
+    max_degree: u32,
+    output_vamana: String,
+    rng: &mut impl Rng,
+) -> ANNResult<()>
+where
+    StorageProvider: StorageReadProvider + StorageWriteProvider,
+{
+    // Read ID maps
+    let mut vamana_names = vec![String::new(); num_parts];
+    let mut id_maps: Vec<Vec<u32>> = vec![Vec::new(); num_parts];
+    for shard in 0..num_parts {
+        vamana_names[shard] = DiskIndexWriter::get_merged_index_subshard_mem_index_file(
+            merged_index_prefix,
+            shard,
+        );
+
+        let id_maps_file =
+            DiskIndexWriter::get_merged_index_subshard_id_map_file(merged_index_prefix, shard);
+        id_maps[shard] = read_idmap(storage_provider, id_maps_file)?;
+    }
+
+    // find max node id
+    let num_nodes: u32 = *id_maps.iter().flatten().max().unwrap_or(&0) + 1;
+    let num_elements: u32 = id_maps.iter().map(|idmap| idmap.len() as u32).sum();
+    info!("# nodes: {}, max degree: {}", num_nodes, max_degree);
+
+    // compute inverse map: node -> shards
+    let mut node_shard: Vec<(u32, u32)> = Vec::with_capacity(num_elements as usize);
+    for (shard, id_map) in id_maps.iter().enumerate() {
+        info!("Creating inverse map -- shard #{}", shard);
+        node_shard.extend(id_map.iter().map(|node_id| (*node_id, shard as u32)));
+    }
+    node_shard.sort_unstable_by(|left, right| {
+        left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+    });
+
+    info!("Finished computing node -> shards map");
+
+    // create cached vamana readers
+    let mut vamana_readers = Vec::new();
+    for name in &vamana_names {
+        let reader = CachedReader::<StorageProvider>::new(
+            name,
+            READ_WRITE_BLOCK_SIZE,
+            storage_provider,
+        )?;
+        vamana_readers.push(reader);
+    }
+
+    // create cached vamana writers
+    let mut merged_vamana_cached_writer = CachedWriter::<StorageProvider>::new(
+        &output_vamana,
+        READ_WRITE_BLOCK_SIZE,
+        storage_provider.create_for_write(&output_vamana)?,
+    )?;
+
+    // expected file size + max degree + medoid_id + frozen_point info
+    let vamana_metadata_size =
+        size_of::<u64>() + size_of::<u32>() + size_of::<u32>() + size_of::<u64>();
+
+    // we initialize the size of the merged index to the metadata size
+    // we will overwrite the index size at the end
+    let mut merged_index_size: u64 = vamana_metadata_size as u64;
+    merged_vamana_cached_writer.write(&merged_index_size.to_le_bytes())?;
+
+    let mut read_buf_8_bytes = [0u8; 8];
+
+    // get max input width
+    let mut max_input_width = 0;
+    // read width from each vamana to advance buffer by sizeof(uint32_t) bytes
+    for reader in &mut vamana_readers {
+        reader.read(&mut read_buf_8_bytes)?;
+        let _expected_file_size: u64 = u64::from_le_bytes(read_buf_8_bytes);
+        let input_width = reader.read_u32()?;
+        max_input_width = input_width.max(max_input_width);
+    }
+
+    // write max_degree to merged_vamana_index
+    let output_width: u32 = max_degree;
+    info!(
+        "Max input width: {}, output width: {}",
+        max_input_width, output_width
+    );
+
+    merged_vamana_cached_writer.write(&output_width.to_le_bytes())?;
+
+    // write medoid to merged_vamana_index
+    for shard in 0..num_parts {
+        // read medoid
+        let mut medoid: u32 = vamana_readers[shard].read_u32()?;
+        vamana_readers[shard].read(&mut read_buf_8_bytes)?;
+        let vamana_index_frozen: u64 = u64::from_le_bytes(read_buf_8_bytes);
+        debug_assert_eq!(vamana_index_frozen, 0);
+
+        // rename medoid
+        medoid = id_maps[shard][medoid as usize];
+
+        // write renamed medoid
+        if shard == (num_parts - 1) {
+            // uncomment if running hierarchical
+            merged_vamana_cached_writer.write(&medoid.to_le_bytes())?;
+        }
+    }
+
+    let vamana_index_frozen: u64 = 0; // as of now the functionality to merge many overlapping vamana
+                                      // indices is supported only for bulk indices without frozen point.
+                                      // Hence the final index will also not have any frozen points.
+    merged_vamana_cached_writer.write(&vamana_index_frozen.to_le_bytes())?;
+
+    info!("Starting merge");
+
+    let mut nbr_set = vec![false; num_nodes as usize];
+    let mut final_nbrs: Vec<u32> = Vec::new();
+    let mut cur_id = 0;
+    for pair in &node_shard {
+        let (node_id, shard_id) = *pair;
+        if cur_id < node_id {
+            final_nbrs.shuffle(rng);
+
+            let nnbrs: u32 = std::cmp::min(final_nbrs.len() as u32, max_degree);
+            merged_vamana_cached_writer.write(&nnbrs.to_le_bytes())?;
+
+            let bytes = final_nbrs
+                .iter()
+                .take(nnbrs as usize)
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<u8>>();
+            merged_vamana_cached_writer.write(&bytes)?;
+
+            merged_index_size += (size_of::<u32>() + nnbrs as usize * size_of::<u32>()) as u64;
+            if cur_id % 499999 == 1 {
+                print!(".");
+            }
+            cur_id = node_id;
+
+            final_nbrs.iter().for_each(|p| nbr_set[*p as usize] = false);
+            final_nbrs.clear();
+        }
+
+        // read num of neighbors from vamana index
+        let num_nbrs = vamana_readers[shard_id as usize].read_u32()?;
+
+        if num_nbrs == 0 {
+            info!(
+                "WARNING: shard #{}, node_id {} has 0 nbrs",
+                shard_id, node_id
+            );
+        } else {
+            let mut nbrs_bytes = vec![0u8; num_nbrs as usize * mem::size_of::<u32>()];
+            vamana_readers[shard_id as usize].read(&mut nbrs_bytes)?;
+            let nbrs: &[u32] = bytemuck::cast_slice(&nbrs_bytes);
+
+            // rename nodes
+            for j in 0..num_nbrs {
+                let nbr = nbrs[j as usize];
+                let renamed_node = id_maps[shard_id as usize][nbr as usize];
+                if !nbr_set[renamed_node as usize] {
+                    nbr_set[renamed_node as usize] = true;
+                    final_nbrs.push(renamed_node);
+                }
+            }
+        }
+    }
+
+    // write the last node, to be refactored...
+    final_nbrs.shuffle(rng);
+
+    let nnbrs: u32 = std::cmp::min(final_nbrs.len() as u32, max_degree);
+    merged_vamana_cached_writer.write(&nnbrs.to_le_bytes())?;
+
+    let bytes = final_nbrs
+        .iter()
+        .take(nnbrs as usize)
+        .flat_map(|x| x.to_le_bytes())
+        .collect::<Vec<u8>>();
+    merged_vamana_cached_writer.write(&bytes)?;
+
+    merged_index_size += (size_of::<u32>() + nnbrs as usize * size_of::<u32>()) as u64;
+
+    nbr_set.clear();
+    final_nbrs.clear();
+
+    info!("Expected size: {}", merged_index_size);
+    merged_vamana_cached_writer.reset()?;
+    merged_vamana_cached_writer.write(&merged_index_size.to_le_bytes())?;
+
+    info!("Finished merge");
+    Ok(())
+}
+
+/// [`merge_vamana_shards`] with the rng constructed here, from `seed`.
+///
+/// Saves an out-of-crate caller from depending on this crate's exact `rand` version just to hand
+/// over an `impl Rng` -- the trait is version-specific, so a caller on a different `rand` could not
+/// satisfy it. Uses the same `StandardRng` the in-tree merged build path uses, so a seeded run here
+/// and a seeded run through `MergedVamanaIndexWorkflow` shuffle identically.
+///
+/// `seed` matters: the merge shuffles each node's unioned neighbour set before truncating to
+/// `max_degree`, so the seed selects *which* edges a multi-shard node keeps. Pass `Some` for a
+/// reproducible graph.
+pub fn merge_vamana_shards_seeded<StorageProvider>(
+    storage_provider: &StorageProvider,
+    merged_index_prefix: &str,
+    num_parts: usize,
+    max_degree: u32,
+    output_vamana: String,
+    seed: Option<u64>,
+) -> ANNResult<()>
+where
+    StorageProvider: StorageReadProvider + StorageWriteProvider,
+{
+    let mut rng = diskann_providers::utils::create_rnd_from_optional_seed(seed);
+    merge_vamana_shards(
+        storage_provider,
+        merged_index_prefix,
+        num_parts,
+        max_degree,
+        output_vamana,
+        &mut rng,
+    )
+}
+
+/// `read_bin::<u32>` over a shard id-map file: `[u32 count][u32 1][u32 x count]`.
+fn read_idmap<StorageProvider>(
+    storage_provider: &StorageProvider,
+    idmaps_path: String,
+) -> Result<Vec<u32>, diskann_utils::io::ReadBinError>
+where
+    StorageProvider: StorageReadProvider,
+{
+    let data = read_bin::<u32>(&mut storage_provider.open_reader(&idmaps_path)?)?;
+    Ok(data.into_inner().into_vec())
 }
 
 pub(crate) enum IndexBuildStrategy {
