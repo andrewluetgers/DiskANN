@@ -9,6 +9,7 @@ pub use generator::{GeneratorContext, QuantDataGenerator};
 pub(crate) mod pq;
 pub use pq::pq_generation::{PQGeneration, PQGenerationContext};
 pub use pq::PQData;
+pub use pq::{DiskPQCodes, PQResidency};
 
 mod compressor;
 pub use compressor::{CompressionStage, QuantCompressor};

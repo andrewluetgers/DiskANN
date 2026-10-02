@@ -32,6 +32,12 @@ pub struct QueryStatistics {
 
     /// Number of hops performed during search.
     pub search_hops: u32,
+
+    /// PQ code pages read from the codes file (disk-resident PQ / scale mode only; always 0 when
+    /// the codes are resident). Counted separately from `total_io_operations`, which counts node
+    /// sectors and drives the search IO limit, so enabling scale mode does not change how far a
+    /// search is allowed to go.
+    pub pq_code_page_reads: u32,
 }
 
 /// Calculates the percentile value of a specific metric in a list of QueryStats.

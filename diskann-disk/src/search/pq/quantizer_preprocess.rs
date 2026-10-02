@@ -51,6 +51,15 @@ pub fn quantizer_preprocess(
 
     // Compute the pq distance between query vector to all the vertex in the pq
     // calculation id scratch.
+    //
+    // Skipped when the codes are disk-resident: there is no code table in RAM to index, and the
+    // disk search path never reads this result (the start point is scored exactly from its own
+    // vector in `start_point_distances`), so paying a code-page read per query here would buy
+    // nothing. Callers that need these ids scored in disk mode go through the accessor's
+    // `pq_distances`, which fetches the codes.
+    if pq_data.disk_codes().is_some() {
+        return Ok(());
+    }
     compute_pq_distance(
         id_to_calculate_pq_distance,
         pq_data.get_num_chunks(),

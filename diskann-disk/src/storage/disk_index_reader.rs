@@ -9,6 +9,9 @@ use diskann_providers::storage::StorageReadProvider;
 use diskann_providers::{storage::PQStorage, utils::load_metadata_from_file};
 
 use crate::search::pq::PQData;
+use crate::storage::quant::pq::{DiskPQCodes, PQResidency};
+use crate::utils::aligned_file_reader::traits::AlignedReaderFactory;
+use crate::utils::AlignedFileReaderFactory;
 use tracing::info;
 
 /// This struct is used by the DiskIndexSearcher to read the index data from storage. Noted that the index data here is different from index graph,
@@ -52,6 +55,80 @@ impl DiskIndexReader {
 
         Ok(DiskIndexReader {
             pq_data: Arc::<PQData>::new(PQData::new(pq_pivot_table, pq_compressed_data)?),
+            num_points: metadata.npoints(),
+        })
+    }
+
+    /// Like [`Self::new`], with the PQ codes held according to `residency`.
+    ///
+    /// [`PQResidency::Disk`] reads the codes through the platform's native aligned reader
+    /// ([`AlignedFileReaderFactory`]: io_uring + O_DIRECT on Linux), so `pq_compressed_data_path`
+    /// must be a real filesystem path in that mode. Use [`Self::with_disk_pq_codes`] to supply a
+    /// different reader.
+    pub fn with_residency<Storage: StorageReadProvider>(
+        pq_pivot_path: String,
+        pq_compressed_data_path: String,
+        storage_provider: &Storage,
+        residency: PQResidency,
+    ) -> ANNResult<Self> {
+        match residency {
+            PQResidency::Resident => {
+                Self::new(pq_pivot_path, pq_compressed_data_path, storage_provider)
+            }
+            PQResidency::Disk => {
+                let factory = AlignedFileReaderFactory::new(pq_compressed_data_path.clone());
+                Self::with_disk_pq_codes(
+                    pq_pivot_path,
+                    pq_compressed_data_path,
+                    storage_provider,
+                    factory,
+                )
+            }
+        }
+    }
+
+    /// Scale mode: load only the pivot table, and read PQ codes on demand from the
+    /// `_pq_compressed.bin` file through readers built by `codes_reader_factory` (one per search
+    /// scratch). `storage_provider` is used only for the pivots and the codes file's header and
+    /// length; the code bytes are never loaded.
+    pub fn with_disk_pq_codes<Storage, F>(
+        pq_pivot_path: String,
+        pq_compressed_data_path: String,
+        storage_provider: &Storage,
+        codes_reader_factory: F,
+    ) -> ANNResult<Self>
+    where
+        Storage: StorageReadProvider,
+        F: AlignedReaderFactory + 'static,
+        F::AlignedReaderType: 'static,
+    {
+        let pq_storage = PQStorage::new(&pq_pivot_path, &pq_compressed_data_path, None);
+        let pq_pivot_table =
+            pq_storage.load_pq_pivots_bin::<Storage>(&pq_pivot_path, 0, storage_provider)?;
+        let num_chunks = pq_pivot_table.get_num_chunks();
+
+        let metadata = load_metadata_from_file(storage_provider, &pq_compressed_data_path)?;
+        if metadata.ndims() != num_chunks {
+            return Err(diskann::ANNError::log_index_error(format!(
+                "pq codes file {pq_compressed_data_path} has {} chunks, pivots have {num_chunks}",
+                metadata.ndims()
+            )));
+        }
+        let file_len = storage_provider.get_length(&pq_compressed_data_path)?;
+        let disk_codes = DiskPQCodes::new(
+            codes_reader_factory,
+            metadata.npoints(),
+            num_chunks,
+            file_len,
+        )?;
+        info!(
+            "Loaded PQ centroids; compressed vectors stay on disk. #points:{} #pq_chunks: {}",
+            metadata.npoints(),
+            num_chunks
+        );
+
+        Ok(DiskIndexReader {
+            pq_data: Arc::new(PQData::new_disk_resident(pq_pivot_table, disk_codes)?),
             num_points: metadata.npoints(),
         })
     }

@@ -10,13 +10,20 @@ use diskann_providers::model::FixedChunkPQTable;
 use diskann_quantization::product::TransposedTable;
 use diskann_utils::views::Matrix;
 
+use super::disk_pq_codes::{DiskPQCodes, PQResidency};
+
 #[derive(Debug)]
 pub struct PQData {
     // pq pivot table.
     pq_pivot_table: TransposedTable,
 
-    // pq compressed vectors, shape `num_points × num_pq_chunks`.
+    // pq compressed vectors, shape `num_points × num_pq_chunks`. Empty (zero rows) when the codes
+    // are disk-resident, see `disk_codes`.
     pq_compressed_data: Matrix<u8>,
+
+    // `Some` in scale mode: the codes stay in the file and are read per batch, see
+    // [`PQResidency::Disk`].
+    disk_codes: Option<DiskPQCodes>,
 }
 
 impl PQData {
@@ -33,7 +40,33 @@ impl PQData {
         Ok(Self {
             pq_pivot_table,
             pq_compressed_data,
+            disk_codes: None,
         })
+    }
+
+    /// Like [`Self::new`], but the codes stay on disk: only the pivot table is held in RAM.
+    pub fn new_disk_resident(
+        pq_pivot_table: FixedChunkPQTable,
+        disk_codes: DiskPQCodes,
+    ) -> ANNResult<Self> {
+        let num_chunks = pq_pivot_table.get_num_chunks();
+        let mut this = Self::new(pq_pivot_table, Matrix::new(0u8, 0, num_chunks))?;
+        this.disk_codes = Some(disk_codes);
+        Ok(this)
+    }
+
+    /// Where the codes live.
+    pub fn residency(&self) -> PQResidency {
+        if self.disk_codes.is_some() {
+            PQResidency::Disk
+        } else {
+            PQResidency::Resident
+        }
+    }
+
+    /// The disk-resident code table, or `None` when the codes are in RAM.
+    pub fn disk_codes(&self) -> Option<&DiskPQCodes> {
+        self.disk_codes.as_ref()
     }
 
     /// Get pq_table
@@ -56,7 +89,8 @@ impl PQData {
         self.pq_pivot_table.ncenters()
     }
 
-    /// Get pq_compressed_data
+    /// Get pq_compressed_data. Empty in disk-resident mode: callers that score codes must go
+    /// through [`Self::disk_codes`] when it is `Some`.
     pub fn pq_compressed_data(&self) -> &Matrix<u8> {
         &self.pq_compressed_data
     }

@@ -51,6 +51,7 @@ use diskann_utils::{
 };
 
 use crate::search::pq::{quantizer_preprocess, PQData, PQScratch};
+use crate::storage::quant::pq::{disk_pq_codes::PQCodeReader, DiskPQCodes};
 use diskann_vector::{distance::Metric, DistanceFunction};
 use tokio::runtime::Runtime;
 use tracing::debug;
@@ -266,6 +267,9 @@ struct IOTracker {
     io_time_us: AtomicU64,
     preprocess_time_us: AtomicU64,
     io_count: AtomicUsize,
+    // Code pages read in disk-resident PQ mode. Kept apart from `io_count`, which counts node
+    // sectors and is what `search_io_limit` caps.
+    pq_code_page_reads: AtomicUsize,
 }
 
 impl Default for IOTracker {
@@ -274,6 +278,7 @@ impl Default for IOTracker {
             io_time_us: AtomicU64::new(0),
             preprocess_time_us: AtomicU64::new(0),
             io_count: AtomicUsize::new(0),
+            pq_code_page_reads: AtomicUsize::new(0),
         }
     }
 }
@@ -294,6 +299,16 @@ impl IOTracker {
 
     fn io_count(&self) -> usize {
         self.io_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn add_pq_code_page_reads(&self, count: usize) {
+        self.pq_code_page_reads
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn pq_code_page_reads(&self) -> usize {
+        self.pq_code_page_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -572,6 +587,9 @@ where
     distance_cache: HashMap<u32, (f32, Data::AssociatedDataType)>,
     pq_scratch: PQScratch,
     vertex_provider: VP,
+    // Reader over the PQ codes file when the codes are disk-resident (scale mode); `None` when
+    // they are in RAM. One per scratch, i.e. per concurrent search, like `vertex_provider`.
+    pq_code_reader: Option<PQCodeReader>,
 }
 
 #[derive(Clone)]
@@ -582,6 +600,7 @@ struct DiskSearchScratchArgs<'a, ProviderFactory> {
     num_pq_centers: usize,
     vertex_factory: &'a ProviderFactory,
     graph_header: &'a GraphHeader,
+    disk_pq_codes: Option<&'a DiskPQCodes>,
 }
 
 impl<Data, ProviderFactory> TryAsPooled<&DiskSearchScratchArgs<'_, ProviderFactory>>
@@ -605,10 +624,13 @@ where
             .vertex_factory
             .create_vertex_provider(DEFAULT_BEAM_WIDTH, args.graph_header)?;
 
+        let pq_code_reader = args.disk_pq_codes.map(DiskPQCodes::reader).transpose()?;
+
         Ok(Self {
             distance_cache: HashMap::new(),
             pq_scratch,
             vertex_provider,
+            pq_code_reader,
         })
     }
 
@@ -660,6 +682,34 @@ where
             if self.provider.graph_header.metadata().associated_data_length > INLINE_ASSOC_MIN {
                 return self.pq_distances_inline(parent, ids, f);
             }
+        }
+        // Scale mode: the codes are not in RAM. Fetch exactly the codes of `ids` from the codes
+        // file (one batched read of their distinct pages), pack them in request order, and score
+        // that packed table with the same kernel the resident branch below uses -- identical
+        // inputs, identical arithmetic, so distances are bit-identical to resident mode.
+        let scratch = &mut *self.scratch;
+        if let Some(reader) = scratch.pq_code_reader.as_mut() {
+            let timer = Instant::now();
+            let gathered = reader.gather(ids)?;
+            IOTracker::add_time(
+                &self.io_tracker.io_time_us,
+                timer.elapsed().as_micros() as u64,
+            );
+            self.io_tracker
+                .add_pq_code_page_reads(gathered.pages_read);
+            let pq_scratch = &mut scratch.pq_scratch;
+            compute_pq_distance(
+                gathered.rows,
+                self.provider.pq_data.get_num_chunks(),
+                &pq_scratch.aligned_pqtable_dist_scratch,
+                gathered.codes,
+                &mut pq_scratch.aligned_pq_coord_scratch,
+                &mut pq_scratch.aligned_dist_scratch,
+            )?;
+            for (i, id) in ids.iter().enumerate() {
+                f(scratch.pq_scratch.aligned_dist_scratch[i], *id);
+            }
+            return Ok(());
         }
         let pq_scratch = &mut self.scratch.pq_scratch;
         compute_pq_distance(
@@ -1010,6 +1060,7 @@ where
                 num_pq_centers: provider.pq_data.get_num_centers(),
                 vertex_factory: vertex_provider_factory,
                 graph_header: &provider.graph_header,
+                disk_pq_codes: provider.pq_data.disk_codes(),
             },
         )?;
 
@@ -1165,6 +1216,7 @@ where
             num_pq_centers: pq_data.get_num_centers(),
             vertex_factory: &vertex_provider_factory,
             graph_header: &graph_header,
+            disk_pq_codes: pq_data.disk_codes(),
         };
         let scratch_pool = Arc::new(ObjectPool::try_new(&scratch_pool_args, 0, None)?);
 
@@ -1507,6 +1559,7 @@ where
         query_stats.io_time_us = IOTracker::time(&io_tracker.io_time_us) as u128;
         query_stats.total_io_operations = io_tracker.io_count() as u32;
         query_stats.total_vertices_loaded = io_tracker.io_count() as u32;
+        query_stats.pq_code_page_reads = io_tracker.pq_code_page_reads() as u32;
         query_stats.query_pq_preprocess_time_us =
             IOTracker::time(&io_tracker.preprocess_time_us) as u128;
         query_stats.cpu_time_us = query_stats.total_execution_time_us
@@ -1764,6 +1817,19 @@ mod disk_provider_tests {
         index_path_prefix: &'a str,
         io_limit: usize,
         caching_strategy: CachingStrategy,
+        pq_codes: TestPqCodes,
+    }
+
+    /// Where a test searcher's PQ codes live.
+    #[derive(Clone, Copy, Debug)]
+    enum TestPqCodes {
+        /// In RAM (the default, original behaviour).
+        Resident,
+        /// Disk-resident, read through the buffered virtual-storage reader (alignment 1).
+        DiskVirtual,
+        /// Disk-resident, read through the platform's native reader over the real fixture file:
+        /// io_uring + O_DIRECT (alignment 512) on Linux.
+        DiskNative,
     }
 
     impl Default for CreateDiskIndexSearcherParams<'_> {
@@ -1776,6 +1842,7 @@ mod disk_provider_tests {
                 index_path_prefix: "",
                 io_limit: usize::MAX,
                 caching_strategy: CachingStrategy::None,
+                pq_codes: TestPqCodes::Resident,
             }
         }
     }
@@ -1797,11 +1864,28 @@ mod disk_provider_tests {
             .build()
             .unwrap();
 
-        let disk_index_reader = DiskIndexReader::new(
-            params.pq_pivot_file_path.to_string(),
-            params.pq_compressed_file_path.to_string(),
-            storage_provider.as_ref(),
-        )
+        let pivots = params.pq_pivot_file_path.to_string();
+        let codes = params.pq_compressed_file_path.to_string();
+        let disk_index_reader = match params.pq_codes {
+            TestPqCodes::Resident => {
+                DiskIndexReader::new(pivots, codes, storage_provider.as_ref())
+            }
+            TestPqCodes::DiskVirtual => DiskIndexReader::with_disk_pq_codes(
+                pivots,
+                codes.clone(),
+                storage_provider.as_ref(),
+                VirtualAlignedReaderFactory::new(codes, Arc::clone(storage_provider)),
+            ),
+            TestPqCodes::DiskNative => {
+                let real_path = test_data_root().join(codes.trim_start_matches('/'));
+                DiskIndexReader::with_disk_pq_codes(
+                    pivots,
+                    codes,
+                    storage_provider.as_ref(),
+                    AlignedFileReaderFactory::new(real_path.to_string_lossy().into_owned()),
+                )
+            }
+        }
         .unwrap();
 
         let aligned_reader_factory = VirtualAlignedReaderFactory::new(
@@ -1823,6 +1907,80 @@ mod disk_provider_tests {
             Some(runtime),
         )
         .unwrap()
+    }
+
+    /// Scale mode is a residency change only: the same index searched with its PQ codes in RAM
+    /// and on disk must return identical ids AND bit-identical distances, for graph search (codes
+    /// of expanded neighbours) and flat scan (codes of every point, the full-scan path), through
+    /// both the buffered virtual reader and the native reader (O_DIRECT on Linux) over the real
+    /// fixture file. Code-page reads are counted only in disk mode and never touch the node IO
+    /// count that the search IO limit caps.
+    #[rstest]
+    #[case(TEST_PQ_PIVOT_100DIM, TEST_PQ_COMPRESSED_100DIM, TEST_INDEX_PREFIX_100DIM, TEST_QUERY_10PTS_100DIM, 0)]
+    #[case(TEST_PQ_PIVOT_128DIM, TEST_PQ_COMPRESSED_128DIM, TEST_INDEX_PREFIX_128DIM, TEST_QUERY_10PTS_128DIM, 0)]
+    #[case(TEST_PQ_PIVOT_128DIM, TEST_PQ_COMPRESSED_128DIM, TEST_INDEX_PREFIX_128DIM, TEST_QUERY_10PTS_128DIM, 32)]
+    fn test_disk_resident_pq_matches_resident(
+        #[case] pivots: &str,
+        #[case] codes: &str,
+        #[case] prefix: &str,
+        #[case] query_file: &str,
+        #[case] bfs_cache_nodes: usize,
+    ) {
+        let storage_provider = Arc::new(VirtualStorageProvider::new_overlay(test_data_root()));
+        let searcher = |pq_codes| {
+            create_disk_index_searcher::<GraphDataF32VectorUnitData>(
+                CreateDiskIndexSearcherParams {
+                    pq_pivot_file_path: pivots,
+                    pq_compressed_file_path: codes,
+                    index_path_prefix: prefix,
+                    caching_strategy: match bfs_cache_nodes {
+                        0 => CachingStrategy::None,
+                        n => CachingStrategy::StaticCacheWithBfsNodes(n),
+                    },
+                    pq_codes,
+                    ..Default::default()
+                },
+                &storage_provider,
+            )
+        };
+        let resident = searcher(TestPqCodes::Resident);
+        assert!(resident.index.provider().pq_data.disk_codes().is_none());
+        let queries =
+            read_bin::<f32>(&mut storage_provider.open_reader(query_file).unwrap()).unwrap();
+
+        type Run = (Vec<u32>, Vec<f32>, QueryStatistics);
+        let run = |s: &DiskIndexSearcher<_, _>, query: &[f32], mode: &SearchMode<'_>| -> Run {
+            let (k, l) = (10, 20);
+            let mut stats = QueryStatistics::default();
+            let mut ids = vec![0u32; k];
+            let mut dists = vec![0f32; k];
+            let mut assoc = vec![(); k];
+            s.search_internal(
+                query, k, l, None, &mut stats, &mut ids, &mut dists, &mut assoc, mode, None,
+            )
+            .unwrap();
+            (ids, dists, stats)
+        };
+
+        for pq_codes in [TestPqCodes::DiskVirtual, TestPqCodes::DiskNative] {
+            let disk = searcher(pq_codes);
+            assert!(disk.index.provider().pq_data.disk_codes().is_some());
+            assert_eq!(disk.index.provider().pq_data.pq_compressed_data().nrows(), 0);
+            for (mode_name, mode) in [("graph", SearchMode::graph()), ("flat", SearchMode::flat())] {
+                for (qi, query) in queries.row_iter().enumerate() {
+                    let (r_ids, r_dists, r_stats) = run(&resident, query, &mode);
+                    let (d_ids, d_dists, d_stats) = run(&disk, query, &mode);
+                    let ctx = format!("{pq_codes:?} {mode_name} query {qi}");
+                    assert_eq!(r_ids, d_ids, "ids differ: {ctx}");
+                    let bits = |v: &[f32]| v.iter().map(|d| d.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&r_dists), bits(&d_dists), "distances differ: {ctx}");
+                    assert_eq!(r_stats.total_comparisons, d_stats.total_comparisons, "{ctx}");
+                    assert_eq!(r_stats.total_io_operations, d_stats.total_io_operations, "{ctx}");
+                    assert_eq!(r_stats.pq_code_page_reads, 0, "{ctx}");
+                    assert!(d_stats.pq_code_page_reads > 0, "no code pages read: {ctx}");
+                }
+            }
+        }
     }
 
     fn load_query_result<StorageReader: StorageReadProvider>(
